@@ -1,13 +1,14 @@
 """Supervised training from MC-simulated labeled data.
 
-資料生成策略：
-1. 隨機生成大量手牌局面（street, hole cards, board, num_players, position）
-2. 用 Monte Carlo 計算 equity
-3. 根據 pot odds + equity + position 自動標記「最佳動作」
-4. 訓練 DecisionModel 擬合這個 oracle
+加速策略：
+- multiprocessing.Pool 並行生成資料（充分利用所有 CPU 核心）
+- mc_sims 預設降到 200（精度損失小，速度提升 1.5x）
+- 批量 chunk 生成，tqdm 顯示整體進度
+- GPU 自動偵測用於訓練階段
 
 Usage:
     python -m training.train_supervised --epochs 50 --samples 100000
+    python -m training.train_supervised --epochs 50 --samples 100000 --workers 0  # 單線程 debug
 """
 from __future__ import annotations
 import argparse
@@ -18,6 +19,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
 from tqdm import tqdm
+import multiprocessing as mp
+import os
 
 from engine.card import Card, Deck
 from engine.game_state import GameState, PlayerState, Street, Action
@@ -27,13 +30,39 @@ from simulator.mc_equity import MonteCarloEquity
 from models.decision_model import DecisionModel
 
 
-def generate_sample(
+def _worker_init():
+    """每個 worker 獨立隨機種子，避免所有 worker 生成相同資料。"""
+    seed = os.getpid()
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+
+
+def _generate_chunk(args: tuple) -> list:
+    """
+    Worker function: 生成 chunk_size 個 sample。
+    回傳 list of (features, label, ev)。
+    不能用 lambda（pickle 限制），所以用頂層函數。
+    """
+    chunk_size, num_players_range, mc_sims = args
+    _worker_init()
+    extractor = FeatureExtractor(mc_sims=mc_sims)
+    results = []
+    for _ in range(chunk_size):
+        num_players = random.randint(*num_players_range)
+        try:
+            feat, label, ev = _generate_single(extractor, num_players, mc_sims)
+            results.append((feat, label, ev))
+        except Exception:
+            pass
+    return results
+
+
+def _generate_single(
     extractor: FeatureExtractor,
     num_players: int,
-    mc_sims: int = 300,
+    mc_sims: int = 200,
 ) -> tuple:
     """Generate one (feature_vector, action_label, ev) tuple."""
-    # Random hand setup
     deck = Deck()
     hole = deck.deal(2)
     street_val = random.choice([Street.PREFLOP, Street.FLOP, Street.TURN, Street.RIVER])
@@ -46,16 +75,16 @@ def generate_sample(
     position = random.randint(0, num_players - 1)
     bb = 1.0
 
-    players = []
-    for i in range(num_players):
-        p = PlayerState(
+    players = [
+        PlayerState(
             player_id=i,
             stack=stack if i == 0 else random.uniform(10, 200),
             hole_cards=hole if i == 0 else [],
             bet=current_bet if i == 0 else 0,
             total_invested=random.uniform(0, pot / 2)
         )
-        players.append(p)
+        for i in range(num_players)
+    ]
 
     state = GameState(
         num_players=num_players,
@@ -75,26 +104,22 @@ def generate_sample(
     else:
         eq = extractor._preflop_equity_proxy(hole, num_players)
 
-    # Oracle label: simplified EV-based decision
+    # Oracle label
     pot_odds = state.pot_odds
     call_amount = max(current_bet - players[0].bet, 0)
     spr = stack / max(pot, 1)
-
-    # EV of calling
     ev_call = eq * (pot + call_amount) - (1 - eq) * call_amount if call_amount > 0 else 0
-    ev_fold = 0
-    ev_raise = (eq * (pot * 2) - (1 - eq) * pot * 0.75) * (1 + position / num_players * 0.2)
 
-    if eq < pot_odds - 0.05:  # clear fold
-        label = 0  # FOLD
-    elif eq > 0.75 and spr < 5:  # strong hand, low SPR -> shove
-        label = 4  # ALL_IN
-    elif eq > 0.65 and position >= num_players // 2:  # strong + position -> big raise
-        label = 3  # RAISE_LARGE
-    elif eq > pot_odds + 0.15:  # good equity + fold equity -> small raise
-        label = 2  # RAISE_SMALL
-    else:  # marginal call
-        label = 1  # CALL
+    if eq < pot_odds - 0.05:
+        label = 0
+    elif eq > 0.75 and spr < 5:
+        label = 4
+    elif eq > 0.65 and position >= num_players // 2:
+        label = 3
+    elif eq > pot_odds + 0.15:
+        label = 2
+    else:
+        label = 1
 
     opv = OpponentProfileVector.default().to_array()
     features = extractor.extract(state, opv)
@@ -104,21 +129,62 @@ def generate_sample(
 def generate_dataset(
     n_samples: int,
     num_players_range: tuple = (2, 6),
-    mc_sims: int = 300,
+    mc_sims: int = 200,
+    num_workers: int = None,
+    chunk_size: int = 500,
 ) -> tuple:
-    extractor = FeatureExtractor(mc_sims=mc_sims)
+    """
+    並行生成資料集。
+
+    Args:
+        n_samples: 目標樣本數
+        num_players_range: 玩家數範圍
+        mc_sims: 每個樣本的 MC 模擬次數（降低可加速）
+        num_workers: 工作線程數，None = 自動偵測 CPU 核心數
+        chunk_size: 每個 worker 每次處理的 sample 數
+    """
+    if num_workers is None:
+        num_workers = max(1, mp.cpu_count() - 1)  # 保留 1 核給主程序
+
+    print(f"     Using {num_workers} workers, mc_sims={mc_sims}, chunk_size={chunk_size}")
+
+    # 計算要分派多少 chunks
+    n_chunks = (n_samples + chunk_size - 1) // chunk_size
+    tasks = [(chunk_size, num_players_range, mc_sims)] * n_chunks
+
     X, y, evs = [], [], []
-    desc = f"Generating {n_samples} samples"
-    for _ in tqdm(range(n_samples), desc=desc):
-        num_players = random.randint(*num_players_range)
-        try:
-            feat, label, ev = generate_sample(extractor, num_players, mc_sims)
-            X.append(feat)
-            y.append(label)
-            evs.append(ev)
-        except Exception:
-            continue
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64), np.array(evs, dtype=np.float32)
+    collected = 0
+
+    if num_workers == 0:
+        # 單線程模式（debug 用）
+        for task in tqdm(tasks, desc=f"Generating (single thread)"):
+            for feat, label, ev in _generate_chunk(task):
+                X.append(feat); y.append(label); evs.append(ev)
+                collected += 1
+                if collected >= n_samples:
+                    break
+            if collected >= n_samples:
+                break
+    else:
+        with mp.Pool(num_workers) as pool:
+            pbar = tqdm(total=n_samples, desc=f"Generating ({num_workers} workers)")
+            for chunk_results in pool.imap_unordered(_generate_chunk, tasks):
+                for feat, label, ev in chunk_results:
+                    X.append(feat); y.append(label); evs.append(ev)
+                    collected += 1
+                    pbar.update(1)
+                    if collected >= n_samples:
+                        break
+                if collected >= n_samples:
+                    break
+            pbar.close()
+            pool.terminate()  # 已夠了就終止剩餘 worker
+
+    return (
+        np.array(X[:n_samples], dtype=np.float32),
+        np.array(y[:n_samples], dtype=np.int64),
+        np.array(evs[:n_samples], dtype=np.float32)
+    )
 
 
 def train(
@@ -126,10 +192,18 @@ def train(
     n_samples: int = 100000,
     batch_size: int = 512,
     lr: float = 1e-3,
+    mc_sims: int = 200,
+    num_workers: int = None,
     save_path: str = 'checkpoints/supervised_model.pt',
 ):
+    # 自動選 device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"     Device: {device}")
+    if device.type == 'cuda':
+        print(f"     GPU: {torch.cuda.get_device_name(0)}")
+
     print("[1/3] Generating dataset...")
-    X, y, evs = generate_dataset(n_samples)
+    X, y, evs = generate_dataset(n_samples, mc_sims=mc_sims, num_workers=num_workers)
     print(f"     Dataset size: {len(X)}, class distribution: {np.bincount(y)}")
 
     split = int(0.9 * len(X))
@@ -141,10 +215,15 @@ def train(
         torch.tensor(X_train), torch.tensor(y_train), torch.tensor(ev_train))
     val_ds = TensorDataset(
         torch.tensor(X_val), torch.tensor(y_val), torch.tensor(ev_val))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
 
-    model = DecisionModel(input_dim=39, hidden_dim=256, num_blocks=4)
+    # num_workers for DataLoader（GPU 下開多線程 prefetch）
+    dl_workers = 4 if device.type == 'cuda' else 0
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=dl_workers, pin_memory=(device.type=='cuda'))
+    val_loader = DataLoader(val_ds, batch_size=batch_size,
+                            num_workers=dl_workers, pin_memory=(device.type=='cuda'))
+
+    model = DecisionModel(input_dim=39, hidden_dim=256, num_blocks=4).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     ce_loss = nn.CrossEntropyLoss()
@@ -155,6 +234,7 @@ def train(
         model.train()
         total_loss = 0
         for xb, yb, evb in train_loader:
+            xb, yb, evb = xb.to(device), yb.to(device), evb.to(device)
             probs, ev_pred = model(xb)
             loss = ce_loss(torch.log(probs + 1e-8), yb) + 0.5 * mse_loss(ev_pred.squeeze(), evb)
             optimizer.zero_grad()
@@ -164,11 +244,12 @@ def train(
             total_loss += loss.item()
         scheduler.step()
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 5 == 0:
             model.eval()
             correct = 0
             with torch.no_grad():
                 for xb, yb, _ in val_loader:
+                    xb, yb = xb.to(device), yb.to(device)
                     probs, _ = model(xb)
                     pred = probs.argmax(dim=-1)
                     correct += (pred == yb).sum().item()
@@ -177,17 +258,27 @@ def train(
 
     print("[3/3] Saving model...")
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    model.save(save_path)
+    # 存 CPU 版本方便跨機器讀取
+    cpu_model = model.cpu()
+    cpu_model.save(save_path)
     print(f"     Saved to {save_path}")
     return model
 
 
 if __name__ == '__main__':
+    # Windows 必須有這行，否則 multiprocessing spawn 會遞迴啟動
+    mp.freeze_support()
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--samples', type=int, default=100000)
     parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--mc_sims', type=int, default=200,
+                        help='MC simulations per sample (lower=faster, default=200)')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='Parallel workers for data gen (default=cpu_count-1, 0=single thread)')
     parser.add_argument('--save_path', type=str, default='checkpoints/supervised_model.pt')
     args = parser.parse_args()
-    train(args.epochs, args.samples, args.batch_size, args.lr, args.save_path)
+    train(args.epochs, args.samples, args.batch_size, args.lr,
+          args.mc_sims, args.workers, args.save_path)
