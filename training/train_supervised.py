@@ -5,7 +5,7 @@
 - 重新執行自動從最新 checkpoint 繼續，不需要額外參數
 - 資料集生成後自動快取到 .npz，下次直接讀取（跳過耗時的 MC 模擬）
 - GPU 自動偵測，支援 Colab T4/A100
-- multiprocessing 平行生成資料
+- concurrent.futures 平行生成資料（修復 Windows/Colab 下 mp.Pool 卡死問題）
 
 Usage:
     # 第一次執行
@@ -17,8 +17,8 @@ Usage:
     # 強制重新開始
     python -m training.train_supervised --epochs 50 --samples 100000 --reset
 
-    # 指定 checkpoint 目錄
-    python -m training.train_supervised --ckpt_dir /content/drive/MyDrive/poker_ckpt
+    # 強制單線程（最穩定，速度稍慢）
+    python -m training.train_supervised --workers 0
 """
 from __future__ import annotations
 import argparse
@@ -46,18 +46,10 @@ from models.decision_model import DecisionModel
 # Checkpoint utilities
 # ─────────────────────────────────────────────
 
-def save_checkpoint(
-    ckpt_dir: Path,
-    epoch: int,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    best_val_acc: float,
-    train_config: dict,
-):
+def save_checkpoint(ckpt_dir, epoch, model, optimizer, scheduler, best_val_acc, train_config):
+    ckpt_dir = Path(ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / f'epoch_{epoch:04d}.pt'
-
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -66,37 +58,24 @@ def save_checkpoint(
         'best_val_acc': best_val_acc,
         'train_config': train_config,
     }, ckpt_path)
-
-    # 更新 latest 指標
     latest_path = ckpt_dir / 'latest.json'
     with open(latest_path, 'w') as f:
         json.dump({'epoch': epoch, 'path': str(ckpt_path), 'val_acc': best_val_acc}, f, indent=2)
-
-    # 只保留最近 3 個 checkpoint，節省空間
-    all_ckpts = sorted(ckpt_dir.glob('epoch_*.pt'))
-    for old in all_ckpts[:-3]:
+    for old in sorted(ckpt_dir.glob('epoch_*.pt'))[:-3]:
         old.unlink()
-
     return ckpt_path
 
 
-def load_latest_checkpoint(ckpt_dir: Path, model: nn.Module, optimizer, scheduler):
-    """
-    若有 checkpoint 就載入，回傳 (start_epoch, best_val_acc)。
-    若沒有則回傳 (0, 0.0)。
-    """
-    latest_path = ckpt_dir / 'latest.json'
+def load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler):
+    latest_path = Path(ckpt_dir) / 'latest.json'
     if not latest_path.exists():
         return 0, 0.0
-
     with open(latest_path) as f:
         info = json.load(f)
-
     ckpt_path = Path(info['path'])
     if not ckpt_path.exists():
-        print(f"  [warn] Checkpoint file not found: {ckpt_path}, starting fresh.")
+        print(f"  [warn] Checkpoint not found: {ckpt_path}, starting fresh.")
         return 0, 0.0
-
     print(f"  [resume] Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu')
     model.load_state_dict(ckpt['model_state_dict'])
@@ -112,17 +91,18 @@ def load_latest_checkpoint(ckpt_dir: Path, model: nn.Module, optimizer, schedule
 # Dataset cache utilities
 # ─────────────────────────────────────────────
 
-def dataset_cache_path(ckpt_dir: Path, n_samples: int, mc_sims: int) -> Path:
-    return ckpt_dir / f'dataset_n{n_samples}_mc{mc_sims}.npz'
+def dataset_cache_path(ckpt_dir, n_samples, mc_sims):
+    return Path(ckpt_dir) / f'dataset_n{n_samples}_mc{mc_sims}.npz'
 
 
-def save_dataset_cache(path: Path, X, y, evs):
-    path.parent.mkdir(parents=True, exist_ok=True)
+def save_dataset_cache(path, X, y, evs):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, X=X, y=y, evs=evs)
     print(f"  [cache] Dataset saved to {path}")
 
 
-def load_dataset_cache(path: Path):
+def load_dataset_cache(path):
+    path = Path(path)
     if not path.exists():
         return None
     print(f"  [cache] Loading cached dataset from {path}")
@@ -141,6 +121,7 @@ def _worker_init():
 
 
 def _generate_chunk(args: tuple) -> list:
+    """頂層函數（可被 pickle），生成一個 chunk 的資料。"""
     chunk_size, num_players_range, mc_sims = args
     _worker_init()
     extractor = FeatureExtractor(mc_sims=mc_sims)
@@ -184,19 +165,19 @@ def _generate_single(extractor, num_players, mc_sims=200):
         dealer_pos=0, current_player=0, big_blind=bb
     )
 
-    eq = MonteCarloEquity.simulate(hole, board, num_players, n=mc_sims)['equity'] \
-        if board_size >= 3 else extractor._preflop_equity_proxy(hole, num_players)
+    eq = (MonteCarloEquity.simulate(hole, board, num_players, n=mc_sims)['equity']
+          if board_size >= 3 else extractor._preflop_equity_proxy(hole, num_players))
 
     pot_odds = state.pot_odds
     call_amount = max(current_bet - players[0].bet, 0)
     spr = stack / max(pot, 1)
     ev_call = eq * (pot + call_amount) - (1 - eq) * call_amount if call_amount > 0 else 0
 
-    if eq < pot_odds - 0.05:            label = 0
-    elif eq > 0.75 and spr < 5:         label = 4
+    if eq < pot_odds - 0.05:                        label = 0
+    elif eq > 0.75 and spr < 5:                     label = 4
     elif eq > 0.65 and position >= num_players // 2: label = 3
-    elif eq > pot_odds + 0.15:          label = 2
-    else:                               label = 1
+    elif eq > pot_odds + 0.15:                      label = 2
+    else:                                           label = 1
 
     features = extractor.extract(state, OpponentProfileVector.default().to_array())
     return features, label, float(ev_call)
@@ -204,36 +185,87 @@ def _generate_single(extractor, num_players, mc_sims=200):
 
 def generate_dataset(
     n_samples, num_players_range=(2, 6), mc_sims=200,
-    num_workers=None, chunk_size=500
+    num_workers=None, chunk_size=100,   # 小 chunk → 更快看到第一個進度
 ):
+    """
+    並行生成資料集。
+
+    使用 concurrent.futures.ProcessPoolExecutor 取代 mp.Pool，
+    解決 Windows / Colab 下 spawn context 造成 0it/s 卡死的問題。
+    num_workers=0 → 純單線程，最穩定。
+    """
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
-    print(f"     Using {num_workers} workers, mc_sims={mc_sims}")
+
+    print(f"     Using {num_workers} workers, mc_sims={mc_sims}, chunk_size={chunk_size}")
 
     n_chunks = (n_samples + chunk_size - 1) // chunk_size
-    tasks = [(chunk_size, num_players_range, mc_sims)] * n_chunks
+    tasks = [(min(chunk_size, n_samples - i * chunk_size), num_players_range, mc_sims)
+             for i in range(n_chunks)]
+
     X, y, evs = [], [], []
     collected = 0
 
+    # ── 單線程模式 ──────────────────────────────────────
     if num_workers == 0:
-        for task in tqdm(tasks, desc="Generating (single thread)"):
+        pbar = tqdm(total=n_samples, desc="Generating (single thread)")
+        for task in tasks:
             for feat, label, ev in _generate_chunk(task):
                 X.append(feat); y.append(label); evs.append(ev)
                 collected += 1
-                if collected >= n_samples: break
-            if collected >= n_samples: break
+                pbar.update(1)
+                if collected >= n_samples:
+                    break
+            if collected >= n_samples:
+                break
+        pbar.close()
+
+    # ── 多線程模式（concurrent.futures）────────────────
     else:
-        with mp.Pool(num_workers) as pool:
-            pbar = tqdm(total=n_samples, desc=f"Generating ({num_workers} workers)")
-            for chunk_results in pool.imap_unordered(_generate_chunk, tasks):
-                for feat, label, ev in chunk_results:
+        # 先試 ProcessPoolExecutor；若環境不支援（如 Jupyter 某些情況）自動降回 ThreadPoolExecutor
+        try:
+            from concurrent.futures import ProcessPoolExecutor as Executor
+            _use_process = True
+        except Exception:
+            from concurrent.futures import ThreadPoolExecutor as Executor
+            _use_process = False
+
+        pbar = tqdm(total=n_samples, desc=f"Generating ({num_workers} workers)")
+        try:
+            with Executor(max_workers=num_workers) as executor:
+                futures = [executor.submit(_generate_chunk, t) for t in tasks]
+                for fut in futures:
+                    try:
+                        chunk_results = fut.result(timeout=120)  # 單個 chunk 最多等 2 分鐘
+                    except Exception as e:
+                        tqdm.write(f"  [warn] chunk failed: {e}")
+                        continue
+                    for feat, label, ev in chunk_results:
+                        X.append(feat); y.append(label); evs.append(ev)
+                        collected += 1
+                        pbar.update(1)
+                        if collected >= n_samples:
+                            break
+                    if collected >= n_samples:
+                        # 取消未完成的 futures
+                        for f in futures:
+                            f.cancel()
+                        break
+        except Exception as e:
+            pbar.close()
+            print(f"  [warn] Parallel generation failed ({e}), falling back to single thread...")
+            # 完全降回單線程補齊剩餘資料
+            pbar = tqdm(total=n_samples - collected, desc="Generating (fallback single thread)")
+            for task in tasks[collected // chunk_size:]:
+                for feat, label, ev in _generate_chunk(task):
                     X.append(feat); y.append(label); evs.append(ev)
                     collected += 1
                     pbar.update(1)
-                    if collected >= n_samples: break
-                if collected >= n_samples: break
-            pbar.close()
-            pool.terminate()
+                    if collected >= n_samples:
+                        break
+                if collected >= n_samples:
+                    break
+        pbar.close()
 
     return (
         np.array(X[:n_samples], dtype=np.float32),
@@ -287,9 +319,7 @@ def train(
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=dl_w, pin_memory=pin)
 
     # ── 2. Model + optimizer ────────────────────
-    train_config = dict(epochs=epochs, n_samples=n_samples, batch_size=batch_size,
-                        lr=lr, mc_sims=mc_sims)
-
+    train_config = dict(epochs=epochs, n_samples=n_samples, batch_size=batch_size, lr=lr, mc_sims=mc_sims)
     model = DecisionModel(input_dim=39, hidden_dim=256, num_blocks=4).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -301,8 +331,7 @@ def train(
     best_val_acc = 0.0
     if not reset:
         start_epoch, best_val_acc = load_latest_checkpoint(ckpt_dir, model, optimizer, scheduler)
-        model = model.to(device)   # 確保 resume 後模型在正確 device
-        # 把 optimizer 的 state tensors 移到 device
+        model = model.to(device)
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -328,7 +357,6 @@ def train(
             total_loss += loss.item()
         scheduler.step()
 
-        # Validation
         model.eval()
         correct = 0
         with torch.no_grad():
@@ -343,11 +371,7 @@ def train(
         avg_loss = total_loss / len(train_loader)
         print(f"  Epoch {epoch+1:3d}/{epochs} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.3f} | Best: {best_val_acc:.3f}")
 
-        # ── Checkpoint every epoch ──────────────
-        ckpt_path = save_checkpoint(
-            ckpt_dir, epoch, model, optimizer, scheduler,
-            best_val_acc, train_config
-        )
+        ckpt_path = save_checkpoint(ckpt_dir, epoch, model, optimizer, scheduler, best_val_acc, train_config)
         print(f"  [ckpt] Saved → {ckpt_path.name}")
 
     # ── 5. Final model save ──────────────────────
@@ -370,7 +394,7 @@ if __name__ == '__main__':
     parser.add_argument('--workers',    type=int,   default=None)
     parser.add_argument('--ckpt_dir',   type=str,   default='checkpoints')
     parser.add_argument('--save_path',  type=str,   default='checkpoints/supervised_model.pt')
-    parser.add_argument('--reset',      action='store_true', help='Ignore existing checkpoints and restart')
+    parser.add_argument('--reset',      action='store_true')
     args = parser.parse_args()
     train(
         epochs=args.epochs, n_samples=args.samples, batch_size=args.batch_size,
