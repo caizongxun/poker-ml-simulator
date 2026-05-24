@@ -13,7 +13,9 @@ calibrate_tool.py  —  GameSofa 辨識區塊拖拉校正工具
   5. 按 [儲存] → 寫入 regions.json（screen_reader.py 啟動時自動讀取）
   6. 按 [重新截圖] → 重新取得目前選定視窗
   7. 按 [選擇視窗] → 重新挑選目標視窗
-  8. [花色樣本採集] → 點選任意牌區域，選择花色，自動裁切花色圖標存至 suit_templates/
+  8. [花色樣本採集] → 點選任意牌區域，選擇花色，自動裁切存至 suit_templates/
+  9. [牌樣本採集 C] → 點選任意牌區域，選擇完整牌名（點數+花色），存至 card_templates/
+ 10. [下載標準模板] → 自動從網路下載52張標準撲克牌圖片，裁切存至 card_templates/
 
 截圖說明
 --------
@@ -26,8 +28,9 @@ calibrate_tool.py  —  GameSofa 辨識區塊拖拉校正工具
   R                  → 重新截圖
   W                  → 重新選擇視窗
   T                  → 切換花色樣本採集模式
+  C                  → 切換牌樣本採集模式
 
-依賴: tkinter (內建), Pillow
+依賴: tkinter (內建), Pillow, requests (下載模板用)
 """
 
 import sys, re, json, os
@@ -50,14 +53,20 @@ except ImportError:
     print("[ERROR] pip install Pillow")
     sys.exit(1)
 
-SCREEN_READER_PATH = Path("screen_reader.py")
-REGIONS_JSON_PATH  = Path("regions.json")
-DEBUG_DIR          = Path("debug_crops")
-SUIT_TEMPLATE_DIR  = Path("suit_templates")
-MAX_DISPLAY_W      = 1280
-MAX_DISPLAY_H      = 860
-HANDLE_SIZE        = 8
-SELF_TITLE         = "GameSofa 辨識區塊校正工具"
+SCREEN_READER_PATH  = Path("screen_reader.py")
+REGIONS_JSON_PATH   = Path("regions.json")
+DEBUG_DIR           = Path("debug_crops")
+SUIT_TEMPLATE_DIR   = Path("suit_templates")
+CARD_TEMPLATE_DIR   = Path("card_templates")   # ← 新增：完整牌模板目錄
+MAX_DISPLAY_W       = 1280
+MAX_DISPLAY_H       = 860
+HANDLE_SIZE         = 8
+SELF_TITLE          = "GameSofa 辨識區塊校正工具"
+
+RANKS  = ["A","2","3","4","5","6","7","8","9","T","J","Q","K"]
+SUITS  = [("s","♠ 黑桃","#66ccff"), ("h","♥ 紅心","#e84040"),
+          ("d","♦ 紅菱","#ff8c00"), ("c","♣ 黑梅","#aaffaa")]
+ALL_CARDS = [r+s for r in RANKS for s,_,_ in SUITS]  # As, Ah, Ad, Ac, 2s ...
 
 SUIT_SYMBOLS = [
     ("heart",   "♥ 紅心",  "#e84040"),
@@ -92,6 +101,144 @@ DEFAULT_REGIONS = {
     "blind":    (0.8136, 0.2246, 0.9082, 0.2674),
 }
 
+
+# ───────────────────────────────────────────────────────────────
+#  模板匹配辨識核心（供 screen_reader.py 使用，也在此測試）
+# ───────────────────────────────────────────────────────────────
+
+def load_card_templates(template_dir: Path = CARD_TEMPLATE_DIR) -> dict:
+    """
+    載入 card_templates/*.png，回傳 {card_name: gray_np_array}。
+    card_name 格式: As / Ah / Ad / Ac / Ks / ... / 2c
+    """
+    try:
+        import cv2, numpy as np
+    except ImportError:
+        return {}
+    templates = {}
+    if not template_dir.exists():
+        return templates
+    for p in template_dir.glob("*.png"):
+        name = p.stem  # e.g. "Jd"
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            templates[name] = cv2.resize(img, (30, 50))
+    return templates
+
+
+def classify_card(roi_bgr, templates: dict, threshold: float = 0.65) -> str:
+    """
+    用模板匹配辨識牌。
+    roi_bgr: numpy BGR 圖（牌的完整裁切區域）
+    回傳 e.g. "Jd"，辨識不到回傳 "??"
+    """
+    try:
+        import cv2, numpy as np
+    except ImportError:
+        return "??"
+    if not templates:
+        return "??"
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (30, 50))
+    best_name, best_score = "??", -1.0
+    for name, tmpl in templates.items():
+        res = cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)
+        score = float(res[0][0])
+        if score > best_score:
+            best_score, best_name = score, name
+    return best_name if best_score >= threshold else "??"
+
+
+# ───────────────────────────────────────────────────────────────
+#  下載標準模板（使用 Wikimedia 免費撲克牌 SVG 轉 PNG）
+# ───────────────────────────────────────────────────────────────
+
+# PokerStars 風格的公開 SVG 牌組（Wikimedia Commons）
+# 格式: https://upload.wikimedia.org/wikipedia/commons/thumb/{path}/200px-{file}
+_WIKI_SUIT = {"s": "spades", "h": "hearts", "d": "diamonds", "c": "clubs"}
+_WIKI_RANK = {
+    "A":"1", "2":"2", "3":"3", "4":"4", "5":"5", "6":"6",
+    "7":"7", "8":"8", "9":"9", "T":"10", "J":"J", "Q":"Q", "K":"K"
+}
+
+
+def _wikimedia_url(card: str) -> str:
+    """
+    回傳 Wikimedia 撲克牌圖片 URL。
+    使用 SVG playing cards by David Bellot (CC BY-SA).
+    """
+    r, s = card[0], card[1]
+    rank = _WIKI_RANK[r]
+    suit = _WIKI_SUIT[s]
+    # 格式: https://upload.wikimedia.org/wikipedia/commons/thumb/...
+    # 使用 nicubunu 的完整牌組（PNG 直連）
+    filename = f"Card_{rank}_{suit}.svg"
+    # 轉為 200px thumbnail PNG
+    import hashlib
+    hx = hashlib.md5(filename.encode()).hexdigest()[:2]  # Wikimedia 需要前兩碼
+    return (
+        f"https://upload.wikimedia.org/wikipedia/commons/thumb/"
+        f"{filename[0].lower()}/{hx}/{filename}/200px-{filename}.png"
+    )
+
+
+def _backup_url(card: str) -> str:
+    """備用：deckofcardsapi.com（公開 API）"""
+    r, s = card[0], card[1]
+    rank_map = {"T": "0", "J": "J", "Q": "Q", "K": "K", "A": "A"}
+    rank = rank_map.get(r, r)
+    suit = _WIKI_SUIT[s][0].upper()  # S/H/D/C
+    return f"https://deckofcardsapi.com/static/img/{rank}{suit}.png"
+
+
+def download_card_templates(progress_cb=None) -> tuple:
+    """
+    下載52張標準撲克牌圖片，裁切左上角30×50，存至 card_templates/。
+    progress_cb(card, i, total): 進度回調
+    回傳 (成功數, 失敗清單)
+    """
+    try:
+        import requests
+        from PIL import Image as PILImage
+        import io
+    except ImportError:
+        return 0, ["需要安裝: pip install requests Pillow"]
+
+    CARD_TEMPLATE_DIR.mkdir(exist_ok=True)
+    ok, fail = 0, []
+
+    for i, card in enumerate(ALL_CARDS):
+        if progress_cb:
+            progress_cb(card, i, len(ALL_CARDS))
+
+        dest = CARD_TEMPLATE_DIR / f"{card}.png"
+        if dest.exists():
+            ok += 1
+            continue
+
+        url = _backup_url(card)  # 優先用 deckofcardsapi（更穩定）
+        try:
+            resp = requests.get(url, timeout=8)
+            resp.raise_for_status()
+            img = PILImage.open(io.BytesIO(resp.content)).convert("RGB")
+            # 裁切左上角（含點數+花色），縮放到 30×50
+            w, h = img.size
+            # 取左上角 35% 寬、45% 高作為辨識區域
+            crop = img.crop((0, 0, int(w * 0.35), int(h * 0.45)))
+            crop = crop.resize((30, 50), PILImage.LANCZOS)
+            crop.save(str(dest))
+            ok += 1
+            print(f"[OK] {card} → {dest.name}")
+        except Exception as e:
+            fail.append(card)
+            print(f"[FAIL] {card}: {e}")
+
+    return ok, fail
+
+
+# ───────────────────────────────────────────────────────────────
+#  regions.json 讀寫
+# ───────────────────────────────────────────────────────────────
 
 def load_regions_from_file():
     if REGIONS_JSON_PATH.exists():
@@ -153,7 +300,7 @@ def write_regions(regions: dict):
             ("自己籌碼", ["my_stack"]),
             ("Blind", ["blind"]),
         ]:
-            lines.append(f"    # \u2500\u2500 {group_name} \u2500\u2500\n")
+            lines.append(f"    # ── {group_name} ──\n")
             for key in keys:
                 if key in regions:
                     v = regions[key]
@@ -174,6 +321,10 @@ def write_regions(regions: dict):
         print(f"[WARN] 同步 screen_reader.py 失敗: {e}")
     return True
 
+
+# ───────────────────────────────────────────────────────────────
+#  視窗列舉
+# ───────────────────────────────────────────────────────────────
 
 def list_visible_windows():
     if sys.platform != "win32":
@@ -350,63 +501,105 @@ def take_screenshot(hwnd=None):
 
 
 # ───────────────────────────────────────────────────────────────
-#  花色圖標裁切工具
+#  花色圖標裁切（舊功能保留）
 # ───────────────────────────────────────────────────────────────
 
 def extract_suit_icon(card_img: Image.Image) -> Image.Image:
-    """
-    從卡牌圖片裁切左上角花色圖標區域。
-    取左上角 35% 寬、下半段 (33%~80% 高)。
-    回傳截切後放大到 64x64 的圖片。
-    """
     w, h = card_img.size
-    x1 = 0
-    x2 = int(w * 0.38)
-    y1 = int(h * 0.33)
-    y2 = int(h * 0.80)
-    icon = card_img.crop((x1, y1, x2, y2))
-    icon = icon.resize((64, 64), Image.LANCZOS)
-    return icon
+    icon = card_img.crop((0, int(h*0.33), int(w*0.38), int(h*0.80)))
+    return icon.resize((64, 64), Image.LANCZOS)
 
 
 def save_suit_template(card_img: Image.Image, suit_name: str) -> Path:
-    """
-    裁切并儲存花色圖標樣本。
-    如果已存在，自動編號避免覆蓋。
-    suit_name: heart / diamond / spade / club
-    """
     SUIT_TEMPLATE_DIR.mkdir(exist_ok=True)
     icon = extract_suit_icon(card_img)
-
     existing = sorted(SUIT_TEMPLATE_DIR.glob(f"{suit_name}*.png"))
-    if (SUIT_TEMPLATE_DIR / f"{suit_name}.png").exists():
-        idx = len(existing) + 1
-        path = SUIT_TEMPLATE_DIR / f"{suit_name}_{idx}.png"
-    else:
-        path = SUIT_TEMPLATE_DIR / f"{suit_name}.png"
-
+    path = (SUIT_TEMPLATE_DIR / f"{suit_name}.png") if not (SUIT_TEMPLATE_DIR / f"{suit_name}.png").exists() \
+           else SUIT_TEMPLATE_DIR / f"{suit_name}_{len(existing)+1}.png"
     icon.save(str(path))
     print(f"[OK] 花色樣本存至: {path}")
     return path
 
 
 def get_template_counts() -> dict:
-    """回傳各花色現有樣本數量"""
     counts = {}
     for name, _, _ in SUIT_SYMBOLS:
         counts[name] = len(list(SUIT_TEMPLATE_DIR.glob(f"{name}*.png")))
     return counts
 
 
+def get_card_template_counts() -> int:
+    if not CARD_TEMPLATE_DIR.exists():
+        return 0
+    return len(list(CARD_TEMPLATE_DIR.glob("*.png")))
+
+
 # ───────────────────────────────────────────────────────────────
-#  花色選擇彈出視窗
+#  牌樣本選擇彈出視窗（點數 + 花色）
 # ───────────────────────────────────────────────────────────────
 
+def card_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str | None:
+    """
+    顯示卡牌裁切預覽 + 點數/花色選擇器。
+    回傳 card_name e.g. "Jd"，取消回傳 None。
+    """
+    dlg = Toplevel(parent)
+    dlg.title(f"標記牌名 — {region_name}")
+    dlg.configure(bg="#1a1a2e")
+    dlg.transient(parent)
+    dlg.grab_set()
+    dlg.resizable(False, False)
+
+    chosen = {"card": None}
+    rank_var = StringVar(value="A")
+    suit_var = StringVar(value="s")
+
+    # 預覽
+    preview_frame = Frame(dlg, bg="#0d0d1a", padx=8, pady=8)
+    preview_frame.pack(padx=12, pady=(12, 4))
+    card_resized = card_img.resize((120, 170), Image.LANCZOS)
+    card_photo = ImageTk.PhotoImage(card_resized)
+    Label(preview_frame, image=card_photo, bg="#0d0d1a", relief="solid", bd=1).pack()
+    dlg._card_photo = card_photo
+
+    # 點數選擇
+    Label(dlg, text="點數:", bg="#1a1a2e", fg="#aaa", font=("Consolas", 10)).pack(pady=(8,0))
+    rank_frame = Frame(dlg, bg="#1a1a2e")
+    rank_frame.pack(padx=12)
+    for r in RANKS:
+        Radiobutton(rank_frame, text=r, variable=rank_var, value=r,
+                    bg="#1a1a2e", fg="white", selectcolor="#e94560",
+                    activebackground="#1a1a2e", font=("Consolas", 11, "bold")
+                    ).pack(side=LEFT)
+
+    # 花色選擇
+    Label(dlg, text="花色:", bg="#1a1a2e", fg="#aaa", font=("Consolas", 10)).pack(pady=(8,0))
+    suit_frame = Frame(dlg, bg="#1a1a2e")
+    suit_frame.pack(padx=12, pady=(0,8))
+    for s, label, color in SUITS:
+        Radiobutton(suit_frame, text=label, variable=suit_var, value=s,
+                    bg="#1a1a2e", fg=color, selectcolor="#e94560",
+                    activebackground="#1a1a2e", font=("Consolas", 12, "bold"), width=10
+                    ).pack(side=LEFT, padx=4)
+
+    def confirm():
+        chosen["card"] = rank_var.get() + suit_var.get()
+        dlg.destroy()
+
+    btn_bar = Frame(dlg, bg="#1a1a2e")
+    btn_bar.pack(pady=(0, 12))
+    Button(btn_bar, text="確認儲存", command=confirm,
+           bg="#e94560", fg="white", relief="flat", padx=16, pady=6,
+           font=("Consolas", 11, "bold"), cursor="hand2").pack(side=LEFT, padx=8)
+    Button(btn_bar, text="取消", command=dlg.destroy,
+           bg="#444", fg="white", relief="flat", padx=16, pady=6,
+           font=("Consolas", 10), cursor="hand2").pack(side=LEFT)
+
+    dlg.wait_window()
+    return chosen["card"]
+
+
 def suit_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str | None:
-    """
-    顯示卡牌裁切預覽 + 4 個花色按鈕，讓使用者選擇。
-    回傳 suit_name str 或 None (取消)。
-    """
     dlg = Toplevel(parent)
     dlg.title(f"選擇花色 — {region_name}")
     dlg.configure(bg="#1a1a2e")
@@ -415,14 +608,11 @@ def suit_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str |
     dlg.resizable(False, False)
 
     chosen = {"suit": None}
-
     preview_frame = Frame(dlg, bg="#0d0d1a", padx=8, pady=8)
     preview_frame.pack(padx=12, pady=(12, 4))
-
     card_resized = card_img.resize((120, 170), Image.LANCZOS)
     card_photo = ImageTk.PhotoImage(card_resized)
     Label(preview_frame, image=card_photo, bg="#0d0d1a", relief="solid", bd=1).pack(side=LEFT, padx=(0, 12))
-
     icon = extract_suit_icon(card_img)
     icon_photo = ImageTk.PhotoImage(icon)
     icon_frame = Frame(preview_frame, bg="#0d0d1a")
@@ -430,10 +620,8 @@ def suit_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str |
     Label(icon_frame, text="花色圖標\n(將儲存此區堂)", bg="#0d0d1a", fg="#aaa",
           font=("Consolas", 9), justify="center").pack()
     Label(icon_frame, image=icon_photo, bg="#0d0d1a", relief="solid", bd=1).pack(pady=4)
-
     Label(dlg, text="請選擇此張牌的花色:",
           bg="#1a1a2e", fg="white", font=("Consolas", 11, "bold")).pack(pady=(4, 0))
-
     btn_frame = Frame(dlg, bg="#1a1a2e")
     btn_frame.pack(padx=16, pady=10)
 
@@ -444,25 +632,75 @@ def suit_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str |
     counts = get_template_counts()
     for name, label, color in SUIT_SYMBOLS:
         cnt = counts.get(name, 0)
-        btn_text = f"{label}\n(已有 {cnt} 張)"
-        Button(
-            btn_frame, text=btn_text, command=lambda n=name: pick(n),
-            bg="#16213e", fg=color, relief="flat",
-            activebackground="#e94560", activeforeground="white",
-            font=("Consolas", 12, "bold"),
-            width=12, height=3, cursor="hand2",
-            bd=2
-        ).pack(side=LEFT, padx=6)
+        Button(btn_frame, text=f"{label}\n(已有 {cnt} 張)", command=lambda n=name: pick(n),
+               bg="#16213e", fg=color, relief="flat",
+               activebackground="#e94560", activeforeground="white",
+               font=("Consolas", 12, "bold"), width=12, height=3, cursor="hand2", bd=2
+               ).pack(side=LEFT, padx=6)
 
     Button(dlg, text="取消", command=dlg.destroy,
            bg="#444", fg="white", relief="flat", padx=20, pady=6,
            font=("Consolas", 10), cursor="hand2").pack(pady=(0, 12))
-
     dlg._card_photo = card_photo
     dlg._icon_photo = icon_photo
-
     dlg.wait_window()
     return chosen["suit"]
+
+
+# ───────────────────────────────────────────────────────────────
+#  下載進度視窗
+# ───────────────────────────────────────────────────────────────
+
+def download_templates_dialog(parent):
+    """執行下載並顯示進度條視窗。"""
+    import threading
+
+    dlg = Toplevel(parent)
+    dlg.title("下載標準撲克牌模板")
+    dlg.geometry("480x240")
+    dlg.configure(bg="#1a1a2e")
+    dlg.transient(parent)
+    dlg.grab_set()
+    dlg.resizable(False, False)
+
+    Label(dlg, text="正在從 deckofcardsapi.com 下載52張牌模板...",
+          bg="#1a1a2e", fg="white", font=("Consolas", 10)).pack(pady=(16, 4))
+
+    progress_var = StringVar(value="準備中...")
+    Label(dlg, textvariable=progress_var, bg="#1a1a2e", fg="#ffcc00",
+          font=("Consolas", 11, "bold")).pack(pady=4)
+
+    bar_frame = Frame(dlg, bg="#333", width=400, height=20)
+    bar_frame.pack(pady=8)
+    bar_fill = Frame(bar_frame, bg="#e94560", width=0, height=20)
+    bar_fill.place(x=0, y=0)
+
+    result_var = StringVar(value="")
+    Label(dlg, textvariable=result_var, bg="#1a1a2e", fg="#aaffaa",
+          font=("Consolas", 10)).pack(pady=4)
+
+    def _progress(card, i, total):
+        pct = int((i + 1) / total * 400)
+        progress_var.set(f"[{i+1:02d}/{total}] 下載 {card}...")
+        bar_fill.config(width=pct)
+        dlg.update_idletasks()
+
+    def _run():
+        ok, fail = download_card_templates(progress_cb=_progress)
+        msg = f"完成！成功 {ok}/52 張"
+        if fail:
+            msg += f"，失敗: {', '.join(fail[:5])}"
+            if len(fail) > 5:
+                msg += f" 等{len(fail)}張"
+        result_var.set(msg)
+        progress_var.set("下載完成")
+        bar_fill.config(width=400, bg="#00ff41")
+        Button(dlg, text="關閉", command=dlg.destroy,
+               bg="#0f3460", fg="white", relief="flat", padx=20, pady=6,
+               font=("Consolas", 10, "bold")).pack(pady=8)
+
+    threading.Thread(target=_run, daemon=True).start()
+    dlg.wait_window()
 
 
 # ───────────────────────────────────────────────────────────────
@@ -476,22 +714,23 @@ class CalibrateApp:
         self.root.configure(bg="#1a1a2e")
         self.root.resizable(True, True)
 
-        self.target_hwnd = None
+        self.target_hwnd  = None
         self.target_title = None
-        self.screenshot = None
-        self.photo = None
-        self.scale = 1.0
-        self.img_w = 1
-        self.img_h = 1
+        self.screenshot   = None
+        self.photo        = None
+        self.scale        = 1.0
+        self.img_w        = 1
+        self.img_h        = 1
 
-        self.regions = {}
-        self.orig_regions = {}
-        self.selected = None
-        self.drag_mode = None
-        self.drag_start = None
+        self.regions       = {}
+        self.orig_regions  = {}
+        self.selected      = None
+        self.drag_mode     = None
+        self.drag_start    = None
         self.drag_box_start = None
 
         self.suit_collect_mode = False
+        self.card_collect_mode = False   # ← 新增
 
         self._build_ui()
         self._load()
@@ -504,26 +743,45 @@ class CalibrateApp:
             font=("Consolas", 10, "bold"), cursor="hand2",
             activebackground="#e94560", activeforeground="white"
         )
-        Button(toolbar, text="🪟 選擇視窗 (W)",    command=self._choose_window, **btn).pack(side=LEFT, padx=4)
-        Button(toolbar, text="📷 重新截圖 (R)",    command=self._retake,        **btn).pack(side=LEFT, padx=4)
-        Button(toolbar, text="💾 儲存 regions.json (S)", command=self._save, **btn).pack(side=LEFT, padx=4)
-        Button(toolbar, text="↺ 還原選取框 (Del)",   command=self._reset_selected, **btn).pack(side=LEFT, padx=4)
-        Button(toolbar, text="↺↺ 全部還原",         command=self._reset_all,      **btn).pack(side=LEFT, padx=4)
+        Button(toolbar, text="🪟 選擇視窗 (W)",         command=self._choose_window,   **btn).pack(side=LEFT, padx=4)
+        Button(toolbar, text="📷 重新截圖 (R)",         command=self._retake,          **btn).pack(side=LEFT, padx=4)
+        Button(toolbar, text="💾 儲存 (S)",             command=self._save,            **btn).pack(side=LEFT, padx=4)
+        Button(toolbar, text="↺ 還原選取 (Del)",        command=self._reset_selected,  **btn).pack(side=LEFT, padx=4)
+        Button(toolbar, text="↺↺ 全部還原",             command=self._reset_all,       **btn).pack(side=LEFT, padx=4)
 
-        self.suit_btn_var = StringVar(value="🃏 花色樣本採集 OFF (T)")
+        # 花色採集按鈕
+        self.suit_btn_var = StringVar(value="🃏 花色採集 OFF (T)")
         self.suit_btn = Button(
-            toolbar, textvariable=self.suit_btn_var,
-            command=self._toggle_suit_mode,
+            toolbar, textvariable=self.suit_btn_var, command=self._toggle_suit_mode,
             bg="#1a5c1a", fg="#aaffaa", relief="flat", padx=10, pady=4,
             font=("Consolas", 10, "bold"), cursor="hand2",
             activebackground="#2a8c2a", activeforeground="white"
         )
-        self.suit_btn.pack(side=LEFT, padx=8)
+        self.suit_btn.pack(side=LEFT, padx=4)
+
+        # 牌樣本採集按鈕（新增）
+        self.card_btn_var = StringVar(value="🂠 牌採集 OFF (C)")
+        self.card_btn = Button(
+            toolbar, textvariable=self.card_btn_var, command=self._toggle_card_mode,
+            bg="#1a3c5c", fg="#66ccff", relief="flat", padx=10, pady=4,
+            font=("Consolas", 10, "bold"), cursor="hand2",
+            activebackground="#2a6c9c", activeforeground="white"
+        )
+        self.card_btn.pack(side=LEFT, padx=4)
+
+        # 下載模板按鈕（新增）
+        Button(toolbar, text="⬇ 下載標準模板",
+               command=lambda: download_templates_dialog(self.root),
+               bg="#5c3a1a", fg="#ffcc88", relief="flat", padx=10, pady=4,
+               font=("Consolas", 10, "bold"), cursor="hand2",
+               activebackground="#8c6a2a", activeforeground="white"
+               ).pack(side=LEFT, padx=4)
 
         self.status_var = StringVar(value="載入中...")
         Label(toolbar, textvariable=self.status_var, bg="#16213e", fg="#aaa",
               font=("Consolas", 9)).pack(side=RIGHT, padx=12)
 
+        # 側邊欄
         legend = Frame(self.root, bg="#0f3460", width=160)
         legend.pack(side=LEFT, fill=Y)
         Label(legend, text=" 區域列表", bg="#0f3460", fg="white",
@@ -547,8 +805,18 @@ class CalibrateApp:
         self.suit_count_var = StringVar(value="-")
         Label(legend, textvariable=self.suit_count_var, bg="#0f3460", fg="#ffcc00",
               font=("Consolas", 9), justify=LEFT, anchor="w", wraplength=150).pack(fill=X, padx=4, pady=2)
-        self._update_suit_counts()
 
+        # 牌模板數量顯示（新增）
+        Label(legend, text=" 牌模板數", bg="#0f3460", fg="#aaa",
+              font=("Consolas", 9), anchor="w").pack(fill=X)
+        self.card_count_var = StringVar(value="0 / 52")
+        Label(legend, textvariable=self.card_count_var, bg="#0f3460", fg="#66ccff",
+              font=("Consolas", 9), justify=LEFT, anchor="w", wraplength=150).pack(fill=X, padx=4, pady=2)
+
+        self._update_suit_counts()
+        self._update_card_counts()
+
+        # Canvas
         canvas_frame = Frame(self.root, bg="#1a1a2e")
         canvas_frame.pack(side=LEFT, fill=BOTH, expand=True)
         hbar = Scrollbar(canvas_frame, orient=HORIZONTAL)
@@ -561,13 +829,13 @@ class CalibrateApp:
         hbar.config(command=self.canvas.xview)
         vbar.config(command=self.canvas.yview)
 
-        self.canvas.bind("<ButtonPress-1>",   self._on_press)
-        self.canvas.bind("<B1-Motion>",        self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>",  self._on_release)
-        self.canvas.bind("<Motion>",           self._on_motion)
+        self.canvas.bind("<ButtonPress-1>",  self._on_press)
+        self.canvas.bind("<B1-Motion>",       self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Motion>",          self._on_motion)
 
-        self.root.bind("<Delete>",   lambda e: self._reset_selected())
-        self.root.bind("<BackSpace>",lambda e: self._reset_selected())
+        self.root.bind("<Delete>",    lambda e: self._reset_selected())
+        self.root.bind("<BackSpace>", lambda e: self._reset_selected())
         self.root.bind("s", lambda e: self._safe_retake_bind(self._save))
         self.root.bind("S", lambda e: self._safe_retake_bind(self._save))
         self.root.bind("r", lambda e: self._safe_retake_bind(self._retake))
@@ -576,34 +844,59 @@ class CalibrateApp:
         self.root.bind("W", lambda e: self._safe_retake_bind(self._choose_window))
         self.root.bind("t", lambda e: self._toggle_suit_mode())
         self.root.bind("T", lambda e: self._toggle_suit_mode())
+        self.root.bind("c", lambda e: self._toggle_card_mode())
+        self.root.bind("C", lambda e: self._toggle_card_mode())
 
     def _safe_retake_bind(self, fn):
-        """呼叫前確認視窗仍存活，避免 TclError。"""
         try:
             self.root.winfo_exists()
             fn()
         except _TclError as e:
-            print(f"[WARN] TclError (視窗已關閉): {e}")
+            print(f"[WARN] TclError: {e}")
 
     def _toggle_suit_mode(self):
+        self.card_collect_mode = False
+        self.card_btn_var.set("🂠 牌採集 OFF (C)")
+        self.card_btn.config(bg="#1a3c5c", fg="#66ccff")
+
         self.suit_collect_mode = not self.suit_collect_mode
         if self.suit_collect_mode:
-            self.suit_btn_var.set("🃏 花色樣本採集 ON (T)")
+            self.suit_btn_var.set("🃏 花色採集 ON (T)")
             self.suit_btn.config(bg="#e94560", fg="white")
             self.canvas.config(cursor="plus")
-            self.status_var.set("🃏 花色採集模式: 點擊任意張牌區域在畫面上")
+            self.status_var.set("🃏 花色採集模式: 點擊牌區域選擇花色")
         else:
-            self.suit_btn_var.set("🃏 花色樣本採集 OFF (T)")
+            self.suit_btn_var.set("🃏 花色採集 OFF (T)")
             self.suit_btn.config(bg="#1a5c1a", fg="#aaffaa")
             self.canvas.config(cursor="crosshair")
             self.status_var.set("已結束花色採集模式")
 
+    def _toggle_card_mode(self):
+        self.suit_collect_mode = False
+        self.suit_btn_var.set("🃏 花色採集 OFF (T)")
+        self.suit_btn.config(bg="#1a5c1a", fg="#aaffaa")
+
+        self.card_collect_mode = not self.card_collect_mode
+        if self.card_collect_mode:
+            self.card_btn_var.set("🂠 牌採集 ON (C)")
+            self.card_btn.config(bg="#e94560", fg="white")
+            self.canvas.config(cursor="plus")
+            cnt = get_card_template_counts()
+            self.status_var.set(f"🂠 牌採集模式: 點擊牌區域標記點數+花色 | 已有 {cnt}/52 張")
+        else:
+            self.card_btn_var.set("🂠 牌採集 OFF (C)")
+            self.card_btn.config(bg="#1a3c5c", fg="#66ccff")
+            self.canvas.config(cursor="crosshair")
+            self.status_var.set("已結束牌採集模式")
+
     def _update_suit_counts(self):
         counts = get_template_counts()
-        lines = []
-        for name, label, _ in SUIT_SYMBOLS:
-            lines.append(f" {label}: {counts.get(name,0)} 張")
+        lines = [f" {label}: {counts.get(name,0)} 張" for name, label, _ in SUIT_SYMBOLS]
         self.suit_count_var.set("\n".join(lines))
+
+    def _update_card_counts(self):
+        cnt = get_card_template_counts()
+        self.card_count_var.set(f"{cnt} / 52 張")
 
     def _load(self):
         self.regions = load_regions_from_file()
@@ -617,12 +910,11 @@ class CalibrateApp:
             if initial:
                 self.status_var.set("尚未選擇目標視窗")
             return
-        self.target_hwnd = hwnd
+        self.target_hwnd  = hwnd
         self.target_title = title
         self._retake()
 
     def _canvas_size(self):
-        """安全取得 canvas 尺寸，若視窗已銷毀則回傳預設值。"""
         try:
             cw = self.canvas.winfo_width()
             ch = self.canvas.winfo_height()
@@ -631,7 +923,6 @@ class CalibrateApp:
             return MAX_DISPLAY_W, MAX_DISPLAY_H
 
     def _retake(self):
-        # 確認視窗仍然存活
         try:
             if not self.root.winfo_exists():
                 return
@@ -649,7 +940,7 @@ class CalibrateApp:
         self.screenshot = img
         self.img_w, self.img_h = img.size
 
-        cw, ch = self._canvas_size()          # ← 安全取得，不再直接呼叫 winfo_*
+        cw, ch = self._canvas_size()
         self.scale = min(1.0, cw / self.img_w, ch / self.img_h)
         dw, dh = int(self.img_w * self.scale), int(self.img_h * self.scale)
         self.photo = ImageTk.PhotoImage(img.resize((dw, dh), Image.LANCZOS))
@@ -678,12 +969,12 @@ class CalibrateApp:
                 clr = REGION_COLORS.get(name, "#fff")
                 width = 3 if name == self.selected else 2
                 c.create_rectangle(x1, y1, x2, y2, outline=clr, width=width, fill="", tags=("region", name))
-                if name == self.selected and not self.suit_collect_mode:
+                if name == self.selected and not self.suit_collect_mode and not self.card_collect_mode:
                     self._draw_handles(x1, y1, x2, y2, clr, name)
                 c.create_text(x1+4, y1+3, text=name, anchor=NW, fill="#000", font=("Consolas", 8, "bold"))
                 c.create_text(x1+3, y1+2, text=name, anchor=NW, fill=clr,   font=("Consolas", 8, "bold"))
         except _TclError:
-            pass  # 視窗已關閉，忽略
+            pass
 
     def _draw_handles(self, x1, y1, x2, y2, clr, name):
         h = HANDLE_SIZE // 2
@@ -735,6 +1026,10 @@ class CalibrateApp:
         cx, cy = self._cxy(e)
         self.drag_start = (cx, cy)
 
+        if self.card_collect_mode:
+            self._collect_card_at(cx, cy)
+            return
+
         if self.suit_collect_mode:
             self._collect_suit_at(cx, cy)
             return
@@ -757,7 +1052,8 @@ class CalibrateApp:
             self.drag_mode = None
         self._redraw(); self._update_coord_label()
 
-    def _collect_suit_at(self, cx, cy):
+    def _collect_card_at(self, cx, cy):
+        """牌採集模式：點擊牌區域 → 彈出點數+花色選擇器 → 存至 card_templates/"""
         if self.screenshot is None:
             messagebox.showwarning("尚未截圖", "請先按 R 重新截圖")
             return
@@ -772,31 +1068,65 @@ class CalibrateApp:
             card_img = self.screenshot.crop((x1, y1, x2, y2))
             region_label = name
         else:
-            default_w = int(0.07 * self.img_w)
-            default_h = int(0.14 * self.img_h)
-            rx = cx / self.scale
-            ry = cy / self.scale
-            x1 = max(0, int(rx - default_w/2))
-            y1 = max(0, int(ry - default_h/2))
-            x2 = min(self.img_w, x1 + default_w)
-            y2 = min(self.img_h, y1 + default_h)
+            dw = int(0.07 * self.img_w)
+            dh = int(0.14 * self.img_h)
+            rx, ry = cx / self.scale, cy / self.scale
+            x1 = max(0, int(rx - dw/2)); y1 = max(0, int(ry - dh/2))
+            x2 = min(self.img_w, x1 + dw); y2 = min(self.img_h, y1 + dh)
+            card_img = self.screenshot.crop((x1, y1, x2, y2))
+            region_label = f"({int(rx)},{int(ry)})"
+
+        card_name = card_picker_dialog(self.root, card_img, region_label)
+        if card_name is None:
+            return
+
+        # 儲存：裁切左上角 35% × 45%，縮放 30×50
+        CARD_TEMPLATE_DIR.mkdir(exist_ok=True)
+        w, h = card_img.size
+        crop = card_img.crop((0, 0, int(w*0.35), int(h*0.45)))
+        crop = crop.resize((30, 50), Image.LANCZOS)
+
+        dest = CARD_TEMPLATE_DIR / f"{card_name}.png"
+        # 若已存在則編號備份
+        if dest.exists():
+            idx = len(list(CARD_TEMPLATE_DIR.glob(f"{card_name}_*.png"))) + 1
+            dest = CARD_TEMPLATE_DIR / f"{card_name}_{idx}.png"
+        crop.save(str(dest))
+
+        self._update_card_counts()
+        cnt = get_card_template_counts()
+        self.status_var.set(f"✅ 已儲存 {card_name} → {dest.name} | 總計 {cnt}/52 張")
+        print(f"[OK] 牌模板: {dest}")
+
+    def _collect_suit_at(self, cx, cy):
+        if self.screenshot is None:
+            messagebox.showwarning("尚未截圖", "請先按 R 重新截圖")
+            return
+        name = self._hit_region(cx, cy)
+        if name:
+            rel = self.regions[name]
+            x1, y1, x2, y2 = (int(rel[0]*self.img_w), int(rel[1]*self.img_h),
+                               int(rel[2]*self.img_w), int(rel[3]*self.img_h))
+            card_img = self.screenshot.crop((x1, y1, x2, y2))
+            region_label = name
+        else:
+            dw = int(0.07 * self.img_w); dh = int(0.14 * self.img_h)
+            rx, ry = cx / self.scale, cy / self.scale
+            x1 = max(0, int(rx-dw/2)); y1 = max(0, int(ry-dh/2))
+            x2 = min(self.img_w, x1+dw); y2 = min(self.img_h, y1+dh)
             card_img = self.screenshot.crop((x1, y1, x2, y2))
             region_label = f"({int(rx)},{int(ry)})"
 
         suit = suit_picker_dialog(self.root, card_img, region_label)
         if suit is None:
             return
-
         path = save_suit_template(card_img, suit)
         self._update_suit_counts()
-        counts = get_template_counts()
-        total = sum(counts.values())
-        self.status_var.set(
-            f"✅ 已儲存 {suit} 樣本 → {path.name} | 總樣本數: {total}"
-        )
+        total = sum(get_template_counts().values())
+        self.status_var.set(f"✅ 已儲存 {suit} → {path.name} | 總樣本: {total}")
 
     def _on_drag(self, e):
-        if self.suit_collect_mode or not self.drag_mode or not self.selected:
+        if self.suit_collect_mode or self.card_collect_mode or not self.drag_mode or not self.selected:
             return
         cx, cy = self._cxy(e)
         bx1, by1, bx2, by2 = self.drag_box_start
@@ -804,10 +1134,8 @@ class CalibrateApp:
 
         if self.drag_mode == "move":
             bw, bh = bx2-bx1, by2-by1
-            nx1 = self._clamp(bx1+dx)
-            ny1 = self._clamp(by1+dy)
-            nx2 = self._clamp(nx1+bw)
-            ny2 = self._clamp(ny1+bh)
+            nx1 = self._clamp(bx1+dx); ny1 = self._clamp(by1+dy)
+            nx2 = self._clamp(nx1+bw); ny2 = self._clamp(ny1+bh)
             if nx2 >= 1.0: nx1 = 1.0-bw; nx2 = 1.0
             if ny2 >= 1.0: ny1 = 1.0-bh; ny2 = 1.0
             self.regions[self.selected] = (nx1, ny1, nx2, ny2)
@@ -830,13 +1158,10 @@ class CalibrateApp:
         self._update_coord_label()
 
     def _on_motion(self, e):
-        if self.suit_collect_mode:
+        if self.suit_collect_mode or self.card_collect_mode:
             cx, cy = self._cxy(e)
             name = self._hit_region(cx, cy)
-            if name and name.startswith(("hole_", "board_")):
-                self.canvas.config(cursor="plus")
-            else:
-                self.canvas.config(cursor="tcross")
+            self.canvas.config(cursor="plus" if (name and name.startswith(("hole_","board_"))) else "tcross")
             return
         cx, cy = self._cxy(e)
         hit = self._hit_handle(cx, cy)
@@ -881,8 +1206,8 @@ class CalibrateApp:
         px2, py2 = int(v[2]*self.img_w), int(v[3]*self.img_h)
         self.coord_var.set(
             f"比例:\n  x1={v[0]:.4f} y1={v[1]:.4f}\n  x2={v[2]:.4f} y2={v[3]:.4f}\n"
-            f"像素 ({self.img_w}\u00d7{self.img_h}):\n  ({px1},{py1})-({px2},{py2})\n"
-            f"大小: {px2-px1}\u00d7{py2-py1}"
+            f"像素 ({self.img_w}×{self.img_h}):\n  ({px1},{py1})-({px2},{py2})\n"
+            f"大小: {px2-px1}×{py2-py1}"
         )
         names = list(self.regions.keys())
         if self.selected in names:
@@ -898,7 +1223,7 @@ class CalibrateApp:
             self.status_var.set(f"已還原: {self.selected}")
 
     def _reset_all(self):
-        if messagebox.askyesno("全部還原", "確定要還原所有區域到原始値？"):
+        if messagebox.askyesno("全部還原", "確定要還原所有區域到原始值？"):
             self.regions = {k: tuple(v) for k, v in self.orig_regions.items()}
             self._redraw(); self._update_coord_label()
             self.status_var.set("已還原全部區域")
@@ -910,9 +1235,7 @@ class CalibrateApp:
             self.orig_regions = {k: tuple(v) for k, v in self.regions.items()}
             self.status_var.set("✅ 已儲存到 regions.json")
             messagebox.showinfo("儲存成功",
-                "座標已寫入 regions.json!\n"
-                "下次執行 screen_reader.py 會自動載入新座標。"
-            )
+                "座標已寫入 regions.json!\n下次執行 screen_reader.py 會自動載入新座標。")
         else:
             messagebox.showerror("儲存失敗", "無法寫入 regions.json")
 
