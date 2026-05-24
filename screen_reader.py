@@ -13,6 +13,11 @@ F10 → 離開
 REGIONS_REL 用比例座標 (0.0~1.0)，啟動時會優先讀取 regions.json。
 若 regions.json 不存在才使用程式內 hardcode 預設值。
 用 calibrate_tool.py 調整後儲存，即可同步到此程式。
+
+截圖說明
+--------
+使用 GetClientRect + ClientToScreen 取得瀏覽器「內容區」的實際位置，
+排除標題列、網址列、書籤列的高度偏移，確保比例座標對齊遊戲畫面。
 """
 
 import sys, os, time, json, subprocess, tempfile, threading
@@ -45,7 +50,7 @@ HAS_WIN32 = False
 if sys.platform == "win32":
     try:
         import win32gui, win32ui, win32con
-        from ctypes import windll; HAS_WIN32 = True
+        from ctypes import windll, wintypes; HAS_WIN32 = True
     except ImportError:
         print("[WARN] pywin32 未安裝，pip install pywin32")
 
@@ -56,6 +61,24 @@ from PIL import Image, ImageDraw
 # ─────────────────────────────────────────────────────────────
 WINDOW_KEYWORDS = ["gamesofa", "神來也", "texas", "德州", "poker",
                    "chrome", "firefox", "edge", "msedge"]
+
+
+def _get_client_rect_screen(hwnd):
+    """
+    回傳 client area 在螢幕上的絕對座標 (left, top, right, bottom) 及尺寸 (w, h)。
+    使用 GetClientRect（不含標題列/工具列）+ ClientToScreen 換算螢幕絕對位置。
+    """
+    # GetClientRect 回傳相對於 client 左上角的 (0, 0, cw, ch)
+    client_rect = win32gui.GetClientRect(hwnd)
+    cw = client_rect[2] - client_rect[0]
+    ch = client_rect[3] - client_rect[1]
+    if cw <= 0 or ch <= 0:
+        return None
+    # ClientToScreen 把 client (0,0) 換算成螢幕絕對座標
+    pt = wintypes.POINT(0, 0)
+    windll.user32.ClientToScreen(hwnd, pt)
+    return pt.x, pt.y, pt.x + cw, pt.y + ch, cw, ch
+
 
 class WindowCapture:
     def __init__(self):
@@ -129,27 +152,52 @@ class WindowCapture:
         return img
 
     def _capture_win32_background(self):
+        """
+        只截取 hwnd 的 client area（不含標題列/網址列/書籤列）。
+        使用 PrintWindow 背景截圖 + GetClientRect/ClientToScreen 取得正確範圍。
+        """
         try:
+            info = _get_client_rect_screen(self.hwnd)
+            if info is None:
+                return None
+            cl, ct, cr, cb, cw, ch = info
+
+            # PrintWindow 截整個視窗
             left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
-            w, h = right-left, bottom-top
-            if w <= 0 or h <= 0: return None
+            ww, wh = right - left, bottom - top
+            if ww <= 0 or wh <= 0:
+                return None
+
             hwnd_dc = win32gui.GetWindowDC(self.hwnd)
             mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
             save_dc = mfc_dc.CreateCompatibleDC()
             bitmap  = win32ui.CreateBitmap()
-            bitmap.CreateCompatibleBitmap(mfc_dc, w, h)
+            bitmap.CreateCompatibleBitmap(mfc_dc, ww, wh)
             save_dc.SelectObject(bitmap)
             result  = windll.user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 2)
             if result == 0:
                 result = windll.user32.PrintWindow(self.hwnd, save_dc.GetSafeHdc(), 1)
-            bmp_info = bitmap.GetInfo(); bmp_str = bitmap.GetBitmapBits(True)
-            img = Image.frombuffer("RGB",(bmp_info["bmWidth"],bmp_info["bmHeight"]),
-                                   bmp_str,"raw","BGRX",0,1)
+            bmp_info = bitmap.GetInfo()
+            bmp_str  = bitmap.GetBitmapBits(True)
+            full_img = Image.frombuffer(
+                "RGB", (bmp_info["bmWidth"], bmp_info["bmHeight"]),
+                bmp_str, "raw", "BGRX", 0, 1
+            )
             win32gui.DeleteObject(bitmap.GetHandle())
             save_dc.DeleteDC(); mfc_dc.DeleteDC()
             win32gui.ReleaseDC(self.hwnd, hwnd_dc)
-            if result == 0: print("[WARN] PrintWindow 失敗，改用全螢幕"); return None
-            return img
+
+            if result == 0:
+                print("[WARN] PrintWindow 失敗，改用全螢幕")
+                return None
+
+            # 裁切出 client area（相對於視窗左上角的偏移）
+            offset_x = cl - left
+            offset_y = ct - top
+            client_img = full_img.crop((offset_x, offset_y, offset_x + cw, offset_y + ch))
+            print(f"[INFO] client area: {cw}×{ch}  (視窗偏移 dx={offset_x} dy={offset_y})")
+            return client_img
+
         except Exception as e:
             print(f"[WARN] win32 截圖失敗: {e}"); return None
 
@@ -371,7 +419,7 @@ def capture_and_analyze(save_debug=True, debug_dir="debug_crops"):
 
     if save_debug:
         annotated.save(f"{debug_dir}/_annotated.png")
-        print(f"[DEBUG] 截圖尺寸: {actual_w}×{actual_h}")
+        print(f"[DEBUG] 截圖尺寸 (client area): {actual_w}×{actual_h}")
         print(f"[DEBUG] 除錯圖存至 {debug_dir}/_annotated.png")
     return results, annotated
 
@@ -384,7 +432,7 @@ def on_f6_calibrate():
         wc = get_window_capture()
         screenshot = wc.capture()
         actual_w, actual_h = screenshot.size
-        print(f"  視窗尺寸: {actual_w} × {actual_h}")
+        print(f"  client area 尺寸: {actual_w} × {actual_h}")
         print(f"  {'Region':<12} {'x1':>6} {'y1':>6} {'x2':>6} {'y2':>6}  (像素)")
         print(f"  {'-'*48}")
         for name, rel in REGIONS_REL.items():

@@ -14,6 +14,11 @@ calibrate_tool.py  —  GameSofa 辨識區塊拖拉校正工具
   6. 按 [重新截圖] → 重新取得目前選定視窗
   7. 按 [選擇視窗] → 重新挑選目標視窗
 
+截圖說明
+--------
+使用 GetClientRect + ClientToScreen 只截取瀏覽器「內容區」，
+排除標題列、網址列、書籤列，與 screen_reader.py 的截圖基準完全一致。
+
 鍵盤快捷鍵:
   Delete / Backspace → 還原選取框到原始座標
   S                  → 儲存
@@ -74,8 +79,7 @@ DEFAULT_REGIONS = {
 
 
 def load_regions_from_file():
-    """優先讀 regions.json，再 fallback 到 screen_reader.py 內的 REGIONS_REL，最後用預設值。"""
-    # 1. 優先讀 regions.json
+    """優先讀 regions.json，再 fallback 到 screen_reader.py 內的 _REGIONS_DEFAULT，最後用預設值。"""
     if REGIONS_JSON_PATH.exists():
         try:
             raw = json.loads(REGIONS_JSON_PATH.read_text(encoding="utf-8"))
@@ -86,10 +90,8 @@ def load_regions_from_file():
         except Exception as e:
             print(f"[WARN] regions.json 讀取失敗: {e}")
 
-    # 2. fallback: 解析 screen_reader.py
     if SCREEN_READER_PATH.exists():
         src = SCREEN_READER_PATH.read_text(encoding="utf-8")
-        # 用 multiline 模式正確抓到整個 _REGIONS_DEFAULT 或 REGIONS_REL 區塊
         for var_name in ("_REGIONS_DEFAULT", "REGIONS_REL"):
             pattern = rf'{re.escape(var_name)}\s*=\s*\{{(.*?)^\}}'
             m = re.search(pattern, src, re.DOTALL | re.MULTILINE)
@@ -119,7 +121,6 @@ def write_regions(regions: dict):
       1. 寫入 regions.json  ← screen_reader.py 優先讀這個
       2. 同步更新 screen_reader.py 內的 _REGIONS_DEFAULT（備份用）
     """
-    # --- 1. 寫 regions.json ---
     try:
         data = {k: list(v) for k, v in regions.items()}
         REGIONS_JSON_PATH.write_text(
@@ -130,7 +131,6 @@ def write_regions(regions: dict):
         print(f"[ERROR] 寫入 regions.json 失敗: {e}")
         return False
 
-    # --- 2. 同步更新 screen_reader.py ---
     if not SCREEN_READER_PATH.exists():
         print("[WARN] screen_reader.py 不存在，跳過同步")
         return True
@@ -138,7 +138,6 @@ def write_regions(regions: dict):
     try:
         src = SCREEN_READER_PATH.read_text(encoding="utf-8")
 
-        # 組出新的 _REGIONS_DEFAULT 區塊
         lines = ["_REGIONS_DEFAULT = {\n"]
         for group_name, keys in [
             ("手牌", ["hole_1", "hole_2"]),
@@ -156,7 +155,6 @@ def write_regions(regions: dict):
         lines.append("}\n")
         new_block = "".join(lines)
 
-        # multiline 替換：從行首的 _REGIONS_DEFAULT = { 一直到獨立一行的 }
         new_src = re.sub(
             r'^_REGIONS_DEFAULT\s*=\s*\{.*?^\}\s*$',
             new_block.rstrip(),
@@ -165,7 +163,7 @@ def write_regions(regions: dict):
         )
 
         if new_src == src:
-            print("[WARN] screen_reader.py 的 _REGIONS_DEFAULT 替換未生效（可能格式有異），regions.json 已寫入，不影響運作")
+            print("[WARN] screen_reader.py 的 _REGIONS_DEFAULT 替換未生效，regions.json 已寫入，不影響運作")
         else:
             SCREEN_READER_PATH.write_text(new_src, encoding="utf-8")
             print(f"[OK] 已同步更新 {SCREEN_READER_PATH} 的 _REGIONS_DEFAULT")
@@ -303,33 +301,61 @@ def _refresh_window_list(lb, windows_ref, info_var):
 
 
 def capture_hwnd(hwnd):
+    """
+    只截取 hwnd 的 client area（不含標題列/網址列/書籤列）。
+    使用 PrintWindow 背景截圖 + GetClientRect/ClientToScreen 取得正確範圍。
+    與 screen_reader.py 的截圖基準完全一致。
+    """
     try:
         import win32gui, win32ui
-        from ctypes import windll
+        from ctypes import windll, wintypes
 
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        w, h = right - left, bottom - top
-        if w <= 0 or h <= 0:
+        # 取得 client area 大小（相對座標）
+        client_rect = win32gui.GetClientRect(hwnd)
+        cw = client_rect[2] - client_rect[0]
+        ch = client_rect[3] - client_rect[1]
+        if cw <= 0 or ch <= 0:
             return None
+
+        # ClientToScreen: client (0,0) → 螢幕絕對座標
+        pt = wintypes.POINT(0, 0)
+        windll.user32.ClientToScreen(hwnd, pt)
+        client_left, client_top = pt.x, pt.y
+
+        # 取整個視窗大小用於 PrintWindow
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        ww, wh = right - left, bottom - top
+        if ww <= 0 or wh <= 0:
+            return None
+
+        # PrintWindow 截整個視窗
         hwnd_dc = win32gui.GetWindowDC(hwnd)
-        mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
         save_dc = mfc_dc.CreateCompatibleDC()
         bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+        bmp.CreateCompatibleBitmap(mfc_dc, ww, wh)
         save_dc.SelectObject(bmp)
         result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
         if result == 0:
             result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 1)
         info = bmp.GetInfo()
         data = bmp.GetBitmapBits(True)
-        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), data, "raw", "BGRX", 0, 1)
+        full_img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), data, "raw", "BGRX", 0, 1)
         win32gui.DeleteObject(bmp.GetHandle())
         save_dc.DeleteDC()
         mfc_dc.DeleteDC()
         win32gui.ReleaseDC(hwnd, hwnd_dc)
+
         if result == 0:
             return None
-        return img
+
+        # 裁切出 client area（相對於視窗左上角的偏移）
+        offset_x = client_left - left
+        offset_y = client_top  - top
+        client_img = full_img.crop((offset_x, offset_y, offset_x + cw, offset_y + ch))
+        print(f"[INFO] client area: {cw}×{ch}  (視窗偏移 dx={offset_x} dy={offset_y})")
+        return client_img
+
     except Exception as e:
         print(f"[WARN] PrintWindow 失敗: {e}")
         return None
@@ -339,9 +365,9 @@ def take_screenshot(hwnd=None):
     if hwnd:
         img = capture_hwnd(hwnd)
         if img:
-            print(f"[OK] 截圖成功 (PrintWindow): {img.size}")
+            print(f"[OK] 截圖成功 (client area): {img.size}")
             return img
-        print("[WARN] 指定視窗 PrintWindow 失敗，改用全螢幕")
+        print("[WARN] 指定視窗截圖失敗，改用全螢幕")
 
     try:
         import pyautogui
@@ -479,7 +505,7 @@ class CalibrateApp:
         self.photo = ImageTk.PhotoImage(img.resize((dw, dh), Image.LANCZOS))
         self.canvas.config(scrollregion=(0, 0, dw, dh))
         target = self.target_title or "全螢幕"
-        self.status_var.set(f"目標: {target} | 截圖: {self.img_w}×{self.img_h} | 縮放: {self.scale:.2f}x")
+        self.status_var.set(f"目標: {target} | client area: {self.img_w}×{self.img_h} | 縮放: {self.scale:.2f}x")
         self._redraw()
 
     def _update_listbox(self):
