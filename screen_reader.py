@@ -4,11 +4,7 @@ GameSofa Texas Hold'em Screen Reader
 =====================================
 按 F9 手動截圖 / F7 切換自動輪詢 -> 辨識手牌 & 公共牌 -> 輸出 last_read.json
 
-座標基準: Chrome 視窗 1264x952 (GameSofa html5_v2)
-實際 tile 尺寸視窗縮放而自動 scale。
-
-安裝:
-    pip install pillow keyboard pyautogui pytesseract opencv-python pywin32
+座標基準: 相對比例座標 (0.0~1.0)，不再依賴固定視窗尺寸
 """
 
 import sys, os, time, json, re, subprocess, tempfile, threading
@@ -54,7 +50,7 @@ if sys.platform == "win32":
     except ImportError:
         print("[WARN] pywin32 未安裝，pip install pywin32")
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 # ─────────────────────────────────────────────────────────────
 # WINDOW CAPTURE
@@ -192,19 +188,6 @@ class WindowCapture:
             return pyautogui.screenshot()
         raise RuntimeError("無法截圖：pyautogui 未安裝")
 
-    def get_client_rect(self):
-        if sys.platform == "win32" and HAS_WIN32 and self.hwnd:
-            try:
-                cl = win32gui.GetClientRect(self.hwnd)
-                wl = win32gui.GetWindowRect(self.hwnd)
-                border_x = (wl[2]-wl[0]-cl[2])//2
-                title_h  = (wl[3]-wl[1])-cl[3]-border_x
-                return {"border_x":border_x,"title_h":title_h,
-                        "client_w":cl[2],"client_h":cl[3]}
-            except Exception:
-                pass
-        return {"border_x":0,"title_h":0,"client_w":0,"client_h":0}
-
 _wc = None
 def get_window_capture() -> WindowCapture:
     global _wc
@@ -212,39 +195,39 @@ def get_window_capture() -> WindowCapture:
     return _wc
 
 # ─────────────────────────────────────────────────────────────
-# REGIONS  (基準: 1264x952 Chrome 視窗, GameSofa html5_v2)
+# REGIONS  ── 相對比例座標 (0.0 ~ 1.0)
+# 基準: 1264×952 Chrome 視窗 (含標題列+書籤列)
+# 使用比例座標後，任何視窗尺寸都能正確對應
 # ─────────────────────────────────────────────────────────────
-# 座標由截圖量測，含 Chrome 標題列 (~140px) + 書籤列 (~37px)
-# client 區域起點約 y=177 (標題列+書籤列+工具列)
-# 牌桌有效範圍: x:10~1254, y:177~952
-
-SCREENSHOT_W = 1264   # Chrome 視窗寬
-SCREENSHOT_H = 952    # Chrome 視窗高（含標題列）
-
-REGIONS = {
+REGIONS_REL = {
     # ── 手牌 (自己，畫面正中央偏下) ──
-    # 截圖可見: 4♥ 在 x≈638~700, 4♦ 在 x≈700~762, y≈615~745
-    "hole_1":   (635, 618, 705, 748),
-    "hole_2":   (702, 618, 772, 748),
+    "hole_1":   (0.5024, 0.6492, 0.5578, 0.7857),
+    "hole_2":   (0.5554, 0.6492, 0.6108, 0.7857),
 
-    # ── 公共牌 (牌桌中央, 4張可見) ──
-    # 6♠ x≈380~450, 7♦ x≈466~536, 5♥ x≈555~625, K♠ x≈644~720, y≈428~545
-    "board_1":  (378, 428, 455, 548),
-    "board_2":  (462, 428, 539, 548),
-    "board_3":  (550, 428, 627, 548),
-    "board_4":  (636, 428, 728, 548),
-    "board_5":  (724, 428, 800, 548),
+    # ── 公共牌 (牌桌中央，最多5張) ──
+    "board_1":  (0.2991, 0.4496, 0.3600, 0.5756),
+    "board_2":  (0.3655, 0.4496, 0.4264, 0.5756),
+    "board_3":  (0.4351, 0.4496, 0.4960, 0.5756),
+    "board_4":  (0.5032, 0.4496, 0.5759, 0.5756),
+    "board_5":  (0.5728, 0.4496, 0.6329, 0.5756),
 
-    # ── 底池 (牌桌中央上方，「825」字樣) ──
-    "pot":      (530, 362, 730, 398),
+    # ── 底池 ──
+    "pot":      (0.4193, 0.3803, 0.5775, 0.4181),
 
-    # ── 自己籌碼 (左下角「7,750」) ──
-    "my_stack": (490, 755, 670, 795),
+    # ── 自己籌碼 ──
+    "my_stack": (0.3877, 0.7931, 0.5301, 0.8351),
 
     # ── Blind (右上角「25/50」) ──
-    # 在牌桌資訊區，不是書籤列
-    "blind":    (990, 218, 1145, 258),
+    "blind":    (0.7832, 0.2290, 0.9059, 0.2710),
 }
+
+def abs_region(rel, actual_w, actual_h):
+    """相對比例 → 絕對像素座標"""
+    rx1, ry1, rx2, ry2 = rel
+    return (
+        int(rx1 * actual_w), int(ry1 * actual_h),
+        int(rx2 * actual_w), int(ry2 * actual_h),
+    )
 
 # ─────────────────────────────────────────────────────────────
 # SUIT DETECTION
@@ -271,7 +254,7 @@ def detect_suit_by_color(crop_img):
         return "red" if red > black*0.3 else "black"
 
 # ─────────────────────────────────────────────────────────────
-# RANK DETECTION
+# RANK DETECTION  (加強 OCR 前處理)
 # ─────────────────────────────────────────────────────────────
 RANK_MAP = {
     'a':'A','1':'A','2':'2','3':'3','4':'4','5':'5',
@@ -281,39 +264,92 @@ RANK_MAP = {
 }
 SUIT_FALLBACK = {"red":"♥","black":"♠"}
 
+def preprocess_for_ocr(crop_img):
+    """裁左上角 + 放大 + 二值化 + 去雜訊"""
+    w, h = crop_img.size
+    corner = crop_img.crop((0, 0, int(w * 0.45), int(h * 0.40)))
+    # 放大 4x
+    corner = corner.resize((corner.width * 4, corner.height * 4), Image.LANCZOS)
+    # 轉灰階
+    corner = corner.convert("L")
+    # Otsu 二值化（用 numpy/cv2，否則用簡單閾值）
+    if HAS_CV2:
+        arr = np.array(corner)
+        _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 白底黑字：若背景偏暗則反轉
+        if binary.mean() < 127:
+            binary = 255 - binary
+        # 輕微 erosion 去雜點
+        kernel = np.ones((2, 2), np.uint8)
+        binary = cv2.erode(binary, kernel, iterations=1)
+        corner = Image.fromarray(binary)
+    else:
+        corner = corner.point(lambda p: 255 if p > 128 else 0, "1")
+    return corner
+
 def detect_rank_ocr(crop_img):
     if not HAS_TESS: return "?"
-    w,h = crop_img.size
-    corner = crop_img.crop((0, 0, int(w*0.45), int(h*0.42)))
-    corner = corner.convert("L")
-    corner = corner.resize((corner.width*3, corner.height*3), Image.LANCZOS)
+    corner = preprocess_for_ocr(crop_img)
     cfg = r'--psm 10 -c tessedit_char_whitelist=AaKkQqJjTt0123456789'
     try:
         text = pytesseract.image_to_string(corner, config=cfg).strip().lower()
         text = ''.join(c for c in text if c.isalnum())
         if text in RANK_MAP: return RANK_MAP[text]
-        if len(text)>=2 and text[:2] in RANK_MAP: return RANK_MAP[text[:2]]
+        if len(text) >= 2 and text[:2] in RANK_MAP: return RANK_MAP[text[:2]]
         if text: return RANK_MAP.get(text[0], "?")
         return "?"
     except Exception: return "?"
 
+# ─────────────────────────────────────────────────────────────
+# EMPTY SLOT DETECTION  (修正 HSV 範圍 + 加入白色牌面檢查)
+# ─────────────────────────────────────────────────────────────
 def is_empty_slot(crop_img):
+    """
+    判斷是否為空牌槽（顯示桌面背景而非牌面）
+    GameSofa 桌面顏色: 深藍綠 (teal/dark-teal)
+    牌面: 白色為主
+    """
     if HAS_CV2:
         arr = np.array(crop_img.convert("RGB"))
+        total_px = arr.shape[0] * arr.shape[1]
+
         hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-        teal_mask = cv2.inRange(hsv, np.array([80,40,80]), np.array([110,200,210]))
-        teal_ratio = cv2.countNonZero(teal_mask) / (arr.shape[0]*arr.shape[1])
-        return teal_ratio > 0.55
+
+        # 偵測桌面 teal（含深色到亮色範圍，GameSofa 深藍綠約 H=160~200→HSV H=80~100）
+        teal1 = cv2.inRange(hsv, np.array([75,  30,  40]), np.array([110, 255, 220]))
+        # 深藍綠偏暗版
+        teal2 = cv2.inRange(hsv, np.array([85,  20,  20]), np.array([115, 180, 120]))
+        teal_px = cv2.countNonZero(teal1) + cv2.countNonZero(teal2)
+        teal_ratio = teal_px / total_px
+
+        # 白色牌面像素（白底）
+        white_mask = cv2.inRange(arr,
+                                  np.array([200, 200, 200]),
+                                  np.array([255, 255, 255]))
+        white_ratio = cv2.countNonZero(white_mask) / total_px
+
+        # 如果 teal 佔多 OR 白色非常少 → 空槽
+        if teal_ratio > 0.40:
+            return True
+        if white_ratio < 0.10 and teal_ratio > 0.20:
+            return True
+        return False
     else:
         arr = crop_img.convert("RGB")
-        w,h = arr.size
-        teal=total=0
-        for y in range(0,h,4):
-            for x in range(0,w,4):
-                r,g,b = arr.getpixel((x,y))
-                total+=1
-                if 0<r<130 and 120<g<220 and 100<b<200: teal+=1
-        return (teal/max(total,1))>0.5
+        w, h = arr.size
+        teal = white = total = 0
+        for y in range(0, h, 3):
+            for x in range(0, w, 3):
+                r, g, b = arr.getpixel((x, y))
+                total += 1
+                if 0 < r < 140 and 100 < g < 220 and 80 < b < 200:
+                    teal += 1
+                if r > 200 and g > 200 and b > 200:
+                    white += 1
+        t = max(total, 1)
+        if teal / t > 0.40: return True
+        if white / t < 0.10 and teal / t > 0.20: return True
+        return False
 
 def analyze_card_region(crop_img, region_name):
     result = {"rank":"?","suit":"?","color":"unknown","confidence":0.0,"region":region_name}
@@ -325,19 +361,8 @@ def analyze_card_region(crop_img, region_name):
     result["suit"]  = SUIT_FALLBACK[color]
     rank = detect_rank_ocr(crop_img)
     result["rank"]  = rank
-    result["confidence"] = 0.9 if rank!="?" else 0.3
+    result["confidence"] = 0.9 if rank != "?" else 0.3
     return result
-
-# ─────────────────────────────────────────────────────────────
-# SCALE REGIONS
-# ─────────────────────────────────────────────────────────────
-def scale_region(region, actual_w, actual_h, border_x=0, title_h=0):
-    x1,y1,x2,y2 = region
-    x1-=border_x; x2-=border_x
-    y1-=title_h;  y2-=title_h
-    sx = actual_w / SCREENSHOT_W
-    sy = actual_h / SCREENSHOT_H
-    return (int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
 
 # ─────────────────────────────────────────────────────────────
 # MAIN CAPTURE
@@ -346,7 +371,6 @@ def capture_and_analyze(save_debug=True, debug_dir="debug_crops"):
     wc = get_window_capture()
     screenshot = wc.capture()
     actual_w, actual_h = screenshot.size
-    cr = wc.get_client_rect()
 
     annotated = screenshot.copy()
     draw = ImageDraw.Draw(annotated)
@@ -354,36 +378,41 @@ def capture_and_analyze(save_debug=True, debug_dir="debug_crops"):
         Path(debug_dir).mkdir(exist_ok=True)
 
     results = {}
-    for name, region in REGIONS.items():
-        scaled = scale_region(region, actual_w, actual_h,
-                              border_x=cr["border_x"], title_h=cr["title_h"])
-        x1,y1,x2,y2 = scaled
-        x1=max(0,x1); y1=max(0,y1)
-        x2=min(actual_w,x2); y2=min(actual_h,y2)
-        if x2<=x1 or y2<=y1: continue
-        crop = screenshot.crop((x1,y1,x2,y2))
-        if save_debug: crop.save(f"{debug_dir}/{name}.png")
+    for name, rel in REGIONS_REL.items():
+        x1, y1, x2, y2 = abs_region(rel, actual_w, actual_h)
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(actual_w, x2); y2 = min(actual_h, y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = screenshot.crop((x1, y1, x2, y2))
+        if save_debug:
+            crop.save(f"{debug_dir}/{name}.png")
 
-        if name.startswith(("hole_","board_")):
+        if name.startswith(("hole_", "board_")):
             card_info = analyze_card_region(crop, name)
             results[name] = card_info
             color = "#00ff41" if name.startswith("hole") else "#ff6b6b"
-            draw.rectangle([x1,y1,x2,y2], outline=color, width=2)
-            if card_info["rank"] and card_info["rank"]!="?":
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+            if card_info["rank"] and card_info["rank"] != "?":
                 label = f'{card_info["rank"]}{card_info["suit"]}'
-            elif card_info["rank"] is None: label="(空)"
-            else: label="?"
-            draw.text((x1+2,y1+2), label, fill=color)
+            elif card_info["rank"] is None:
+                label = "(空)"
+            else:
+                label = "?"
+            draw.text((x1 + 2, y1 + 2), label, fill=color)
         else:
             if HAS_TESS:
                 gray = crop.convert("L")
                 cfg = r'--psm 7 -c tessedit_char_whitelist=0123456789,/'
-                try: text = pytesseract.image_to_string(gray, config=cfg).strip()
-                except Exception: text=""
-            else: text=""
-            results[name] = {"text":text}
-            draw.rectangle([x1,y1,x2,y2], outline="#ffd700", width=2)
-            draw.text((x1+2,y1+2), name, fill="#ffd700")
+                try:
+                    text = pytesseract.image_to_string(gray, config=cfg).strip()
+                except Exception:
+                    text = ""
+            else:
+                text = ""
+            results[name] = {"text": text}
+            draw.rectangle([x1, y1, x2, y2], outline="#ffd700", width=2)
+            draw.text((x1 + 2, y1 + 2), name, fill="#ffd700")
 
     if save_debug:
         annotated.save(f"{debug_dir}/_annotated.png")
@@ -397,48 +426,45 @@ def format_results(results):
     print("\n" + "="*52)
     print("  辨識結果")
     print("="*52)
-    hole=[]; board=[]
-    for i in range(1,3):
-        info = results.get(f"hole_{i}",{})
-        r,s = info.get("rank","?"), info.get("suit","?")
-        conf = info.get("confidence",0)
-        if r and r!="?" and s:
+    hole = []; board = []
+    for i in range(1, 3):
+        info = results.get(f"hole_{i}", {})
+        r, s = info.get("rank", "?"), info.get("suit", "?")
+        conf = info.get("confidence", 0)
+        if r and r != "?" and s:
             hole.append(f"{r}{s}")
-            tag="紅" if info.get("color")=="red" else "黑"
+            tag = "紅" if info.get("color") == "red" else "黑"
             print(f"  手牌 {i}: {r}{s:4s} ({tag}) 信心={conf:.0%}")
         else:
             print(f"  手牌 {i}: 未辨識")
-    for i in range(1,6):
-        info = results.get(f"board_{i}",{})
-        r,s = info.get("rank"), info.get("suit")
+    for i in range(1, 6):
+        info = results.get(f"board_{i}", {})
+        r, s = info.get("rank"), info.get("suit")
         if r is None:
             print(f"  公共牌 {i}: (空)")
             continue
-        if r and r!="?" and s:
+        if r and r != "?" and s:
             board.append(f"{r}{s}")
-            tag="紅" if info.get("color")=="red" else "黑"
+            tag = "紅" if info.get("color") == "red" else "黑"
             print(f"  公共牌 {i}: {r}{s:4s} ({tag})")
         else:
             print(f"  公共牌 {i}: 未辨識")
-    pot   = results.get("pot",{}).get("text","?")
-    blind = results.get("blind",{}).get("text","?")
-    stack = results.get("my_stack",{}).get("text","?")
+    pot   = results.get("pot",      {}).get("text", "?")
+    blind = results.get("blind",    {}).get("text", "?")
+    stack = results.get("my_stack", {}).get("text", "?")
     print(f"\n  底池: {pot}  |  Blind: {blind}  |  籌碼: {stack}")
     print(f"  手牌: {'  '.join(hole) if hole else '(無)'}")
     print(f"  公共牌: {'  '.join(board) if board else '(無)'}")
 
     output = {
-        "hole":board,  # 注意: live_agent 讀這個
         "hole_cards": hole,
-        "board": board,
-        "pot": pot,
-        "blind": blind,
-        "stack": stack,
-        "timestamp": time.strftime("%H:%M:%S")
+        "board":      board,
+        "pot":        pot,
+        "blind":      blind,
+        "stack":      stack,
+        "timestamp":  time.strftime("%H:%M:%S"),
     }
-    # 覆寫 output (修正 key)
-    output["hole_cards"] = hole
-    with open("last_read.json","w",encoding="utf-8") as f:
+    with open("last_read.json", "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
     return output
 
@@ -447,7 +473,7 @@ def format_results(results):
 # ─────────────────────────────────────────────────────────────
 _auto_running = False
 _auto_thread  = None
-_poll_interval = 1.0   # 秒
+_poll_interval = 1.0
 
 def _auto_poll_loop():
     global _auto_running
@@ -484,7 +510,7 @@ def on_f8():
 
 def run_hotkey_mode():
     print("\n╔" + "═"*54 + "╗")
-    print("║  GameSofa Screen Reader v3 — 背景截圖模式          ║")
+    print("║  GameSofa Screen Reader v4 — 比例座標版              ║")
     print("╠" + "═"*54 + "╣")
     wc = get_window_capture()
     if wc.window_title:
@@ -504,26 +530,33 @@ def run_manual_mode():
     print("\n[Manual Mode]  c=截圖  a=切換自動  w=選視窗  q=離開")
     while True:
         cmd = input("\n> ").strip().lower()
-        if cmd in ("c","capture"):
+        if cmd in ("c", "capture"):
             try:
                 res, _ = capture_and_analyze(save_debug=True)
                 format_results(res)
-            except Exception as e: print(f"[ERROR] {e}")
-        elif cmd in ("a","auto"): toggle_auto()
-        elif cmd in ("w","window"): get_window_capture().select_window_interactive()
-        elif cmd in ("q","quit","exit"): print("Bye!"); break
-        else: print("未知指令")
+            except Exception as e:
+                print(f"[ERROR] {e}")
+        elif cmd in ("a", "auto"):
+            toggle_auto()
+        elif cmd in ("w", "window"):
+            get_window_capture().select_window_interactive()
+        elif cmd in ("q", "quit", "exit"):
+            print("Bye!"); break
+        else:
+            print("未知指令")
 
 # ─────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n  GameSofa Screen Reader v3")
+    print("\n  GameSofa Screen Reader v4 (比例座標版)")
     print(f"    keyboard    : {'✓' if HAS_KEYBOARD  else '✗ pip install keyboard'}")
     print(f"    pyautogui   : {'✓' if HAS_PYAUTOGUI else '✗ pip install pyautogui'}")
     print(f"    opencv      : {'✓' if HAS_CV2       else '✗ pip install opencv-python'}")
     print(f"    pytesseract : {'✓' if HAS_TESS      else '✗ pip install pytesseract'}")
     print(f"    pywin32     : {'✓ (背景截圖)' if HAS_WIN32 else '✗ pip install pywin32'}")
     print()
-    if HAS_KEYBOARD: run_hotkey_mode()
-    else: run_manual_mode()
+    if HAS_KEYBOARD:
+        run_hotkey_mode()
+    else:
+        run_manual_mode()
