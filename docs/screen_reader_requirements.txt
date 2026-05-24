@@ -1,0 +1,21 @@
+# GameSofa Texas Hold'em Screen Reader
+# 依賴安裝指令
+
+# 基本必裝
+pillow
+pyautogui
+keyboard
+opencv-python
+
+# OCR（辨識牌面數字）
+pytesseract
+
+# Tesseract OCR 主程式下載:
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#   安裝後路徑通常為: C:\Program Files\Tesseract-OCR\tesseract.exe
+#
+# macOS:   brew install tesseract
+# Ubuntu:  sudo apt install tesseract-ocr
+
+# 一鍵安裝（Windows PowerShell / macOS Terminal）:
+# pip install pillow pyautogui keyboard opencv-python pytesseract
