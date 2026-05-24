@@ -16,9 +16,8 @@ calibrate_tool.py  —  GameSofa 辨識區塊拖拉校正工具
 
 截圖說明
 --------
-直接對 hwnd 的 client DC 做 BitBlt，只截網頁內容區，
-不含標題列/網址列/書籤列，且不受最大化視窗的負座標影響。
-與 screen_reader.py 的截圖基準完全一致。
+使用 PrintWindow(PW_RENDERFULLCONTENT) 截圖，完全與 screen_reader.py 一致，
+可正確捕捉 Edge/Chrome GPU 合成畫面（解決黑屏問題）。
 
 鍵盤快捷鍵:
   Delete / Backspace → 還原選取框到原始座標
@@ -301,48 +300,97 @@ def _refresh_window_list(lb, windows_ref, info_var):
     info_var.set(f"已重新整理，共 {len(windows)} 個視窗")
 
 
+# ─────────────────────────────────────────────────────────────
+#  截圖核心：使用 PrintWindow(PW_RENDERFULLCONTENT)
+#  與 screen_reader.py 的 _capture_printwindow 完全一致
+# ─────────────────────────────────────────────────────────────
+
 def capture_hwnd(hwnd):
     """
-    直接對 hwnd 的 client DC 做 BitBlt 截圖。
-    - 只截 client area（不含標題列/網址列/書籤列）
-    - 不使用 GetWindowRect，不受最大化視窗負座標影響
-    - 不需要 crop 計算
-    與 screen_reader.py 的 _capture_client_bitblt 完全一致。
+    優先使用 screen_reader.py 的 _capture_printwindow（PrintWindow + DWM crop）。
+    若匯入失敗，本地實作相同邏輯作為 fallback。
     """
+    # ── 方法 1：直接呼叫 screen_reader._capture_printwindow ──
     try:
+        import importlib.util, sys as _sys
+        spec = importlib.util.spec_from_file_location("screen_reader", SCREEN_READER_PATH)
+        sr = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sr)
+        img = sr._capture_printwindow(hwnd)
+        if img is not None:
+            print(f"[OK] 截圖成功 (PrintWindow via screen_reader): {img.size}")
+            return img
+        print("[WARN] screen_reader._capture_printwindow 回傳 None，改用本地 fallback")
+    except Exception as e:
+        print(f"[WARN] 無法呼叫 screen_reader._capture_printwindow: {e}，改用本地 fallback")
+
+    # ── 方法 2：本地 PrintWindow fallback（邏輯與 screen_reader 一致）──
+    try:
+        import ctypes, ctypes.wintypes
         import win32gui, win32ui, win32con
 
-        # GetClientRect 取得 client 寬高
-        client_rect = win32gui.GetClientRect(hwnd)
-        cw = client_rect[2] - client_rect[0]
-        ch = client_rect[3] - client_rect[1]
-        if cw <= 0 or ch <= 0:
+        PW_RENDERFULLCONTENT = 2
+
+        # 1. GetWindowRect → bitmap 尺寸
+        wr = win32gui.GetWindowRect(hwnd)
+        ww = wr[2] - wr[0]
+        wh = wr[3] - wr[1]
+        if ww <= 0 or wh <= 0:
             return None
 
-        # 取得 client DC（對應網頁內容區）
-        client_dc = win32gui.GetDC(hwnd)
-        mfc_dc    = win32ui.CreateDCFromHandle(client_dc)
-        save_dc   = mfc_dc.CreateCompatibleDC()
+        hdc_win  = win32gui.GetWindowDC(hwnd)
+        mfc_dc   = win32ui.CreateDCFromHandle(hdc_win)
+        save_dc  = mfc_dc.CreateCompatibleDC()
         bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(mfc_dc, cw, ch)
+        bmp.CreateCompatibleBitmap(mfc_dc, ww, wh)
         save_dc.SelectObject(bmp)
 
-        # BitBlt 從 client DC 複製到 save_dc（不含視窗邊框/標題列）
-        save_dc.BitBlt((0, 0), (cw, ch), mfc_dc, (0, 0), win32con.SRCCOPY)
+        res = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
+        if not res:
+            win32gui.DeleteObject(bmp.GetHandle())
+            save_dc.DeleteDC(); mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hdc_win)
+            print("[WARN] PrintWindow 回傳 0")
+            return None
 
-        info = bmp.GetInfo()
-        data = bmp.GetBitmapBits(True)
-        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), data, "raw", "BGRX", 0, 1)
+        bmp_info = bmp.GetInfo()
+        bmp_data = bmp.GetBitmapBits(True)
+        full_img = Image.frombuffer(
+            "RGB", (bmp_info["bmWidth"], bmp_info["bmHeight"]),
+            bmp_data, "raw", "BGRX", 0, 1
+        )
         win32gui.DeleteObject(bmp.GetHandle())
-        save_dc.DeleteDC()
-        mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, client_dc)
+        save_dc.DeleteDC(); mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hdc_win)
 
-        print(f"[INFO] client area (BitBlt): {cw}×{ch}")
+        # 2. DWM visual rect → 真實視覺邊框
+        DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        class RECT(ctypes.Structure):
+            _fields_ = [("left","i"),("top","i"),("right","i"),("bottom","i")]
+        vis = RECT()
+        ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(vis), ctypes.sizeof(vis)
+        )
+
+        # 3. ClientToScreen(0,0) → client area 左上角螢幕座標
+        pt = ctypes.wintypes.POINT(0, 0)
+        ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(pt))
+
+        # 4. crop offset
+        ox = pt.x - vis.left
+        oy = pt.y - vis.top
+
+        # 5. client area 尺寸
+        cr = win32gui.GetClientRect(hwnd)
+        cw = cr[2]; ch = cr[3]
+
+        img = full_img.crop((ox, oy, ox + cw, oy + ch))
+        print(f"[OK] 截圖成功 (PrintWindow local fallback): {img.size}")
         return img
 
     except Exception as e:
-        print(f"[WARN] BitBlt 截圖失敗: {e}")
+        print(f"[WARN] PrintWindow fallback 失敗: {e}")
         return None
 
 
@@ -350,7 +398,6 @@ def take_screenshot(hwnd=None):
     if hwnd:
         img = capture_hwnd(hwnd)
         if img:
-            print(f"[OK] 截圖成功 (client area): {img.size}")
             return img
         print("[WARN] 指定視窗截圖失敗，改用全螢幕")
 
