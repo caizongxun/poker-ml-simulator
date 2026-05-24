@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="zh-TW" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Texas Hold'em Advisor</title>
+<link href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&display=swap" rel="stylesheet">
+<style>
+:root,[data-theme=light]{--color-bg:#f7f6f2;--color-surface:#f9f8f5;--color-surface-2:#fbfbf9;--color-surface-offset:#f3f0ec;--color-border:#d4d1ca;--color-divider:#dcd9d5;--color-text:#28251d;--color-text-muted:#7a7974;--color-text-faint:#bab9b4;--color-primary:#01696f;--color-primary-hover:#0c4e54;--color-success:#437a22;--color-error:#a12c7b;--color-warning:#964219;--color-gold:#d19900;--color-blue:#006494;--color-card-red:#c0392b;--color-card-black:#2c3e50;--radius-sm:.375rem;--radius-md:.5rem;--radius-lg:.75rem;--radius-xl:1rem;--shadow-md:0 4px 12px oklch(.2 .01 80/.08);--font-body:'Satoshi',sans-serif;--text-xs:clamp(.75rem,.7rem + .25vw,.875rem);--text-sm:clamp(.875rem,.8rem + .35vw,1rem);--text-base:clamp(1rem,.95rem + .25vw,1.125rem);--text-lg:clamp(1.125rem,1rem + .75vw,1.5rem);--text-xl:clamp(1.5rem,1.2rem + 1.25vw,2.25rem);--space-1:.25rem;--space-2:.5rem;--space-3:.75rem;--space-4:1rem;--space-5:1.25rem;--space-6:1.5rem;--space-8:2rem;--space-10:2.5rem;--space-12:3rem;--transition:180ms cubic-bezier(.16,1,.3,1)}
+[data-theme=dark]{--color-bg:#171614;--color-surface:#1c1b19;--color-surface-2:#201f1d;--color-surface-offset:#22211f;--color-border:#393836;--color-divider:#262523;--color-text:#cdccca;--color-text-muted:#797876;--color-text-faint:#5a5957;--color-primary:#4f98a3;--color-primary-hover:#227f8b;--color-success:#6daa45;--color-error:#d163a7;--color-warning:#bb653b;--color-gold:#e8af34;--color-blue:#5591c7;--color-card-red:#e74c3c;--color-card-black:#ecf0f1;--shadow-md:0 4px 12px oklch(0 0 0/.3)}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-font-smoothing:antialiased;scroll-behavior:smooth}
+body{min-height:100dvh;font-family:var(--font-body);font-size:var(--text-base);color:var(--color-text);background:var(--color-bg);line-height:1.6}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border-width:0}
+
+/* LAYOUT */
+.app{display:grid;grid-template-rows:auto 1fr;min-height:100dvh}
+.header{background:var(--color-surface);border-bottom:1px solid var(--color-border);padding:var(--space-4) var(--space-6);display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.header-brand{display:flex;align-items:center;gap:var(--space-3)}
+.logo{display:flex;align-items:center;justify-content:center}
+.brand-name{font-size:var(--text-lg);font-weight:700;letter-spacing:-.02em}
+.brand-sub{font-size:var(--text-xs);color:var(--color-text-muted)}
+.header-actions{display:flex;gap:var(--space-2);align-items:center}
+.btn-icon{background:none;border:1px solid var(--color-border);color:var(--color-text-muted);border-radius:var(--radius-md);padding:var(--space-2);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all var(--transition)}
+.btn-icon:hover{border-color:var(--color-primary);color:var(--color-primary)}
+.main{padding:var(--space-6);max-width:1100px;margin:0 auto;width:100%;display:grid;grid-template-columns:1fr 320px;gap:var(--space-6)}
+@media(max-width:900px){.main{grid-template-columns:1fr}}
+
+/* CARDS */
+.section-card{background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-xl);padding:var(--space-6);box-shadow:var(--shadow-md)}
+.section-title{font-size:var(--text-sm);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--color-text-muted);margin-bottom:var(--space-4)}
+
+/* PLAYING CARDS */
+.cards-area{display:flex;flex-direction:column;gap:var(--space-5)}
+.card-group-label{font-size:var(--text-xs);font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--color-text-faint);margin-bottom:var(--space-2)}
+.card-row{display:flex;gap:var(--space-3);flex-wrap:wrap;align-items:flex-end}
+.playing-card{width:64px;height:96px;border-radius:var(--radius-md);background:var(--color-surface-2);border:2px solid var(--color-border);display:flex;flex-direction:column;align-items:center;justify-content:space-between;padding:var(--space-2);cursor:pointer;transition:all var(--transition);position:relative;user-select:none;box-shadow:0 2px 6px oklch(.2 .01 80/.1)}
+.playing-card:hover,.playing-card:focus{border-color:var(--color-primary);transform:translateY(-3px);box-shadow:0 6px 16px oklch(.2 .01 80/.15)}
+.playing-card.selected{border-color:var(--color-primary);background:color-mix(in oklch,var(--color-primary) 8%,var(--color-surface-2));transform:translateY(-4px)}
+.playing-card.empty{border-style:dashed;opacity:.5}
+.playing-card.empty:hover{opacity:.8}
+.card-rank{font-size:var(--text-lg);font-weight:700;line-height:1;align-self:flex-start}
+.card-suit{font-size:1.6rem;line-height:1}
+.card-rank-bottom{font-size:var(--text-xs);font-weight:700;align-self:flex-end;transform:rotate(180deg);opacity:.7}
+.card-red .card-rank,.card-red .card-suit,.card-red .card-rank-bottom{color:var(--color-card-red)}
+.card-black .card-rank,.card-black .card-suit,.card-black .card-rank-bottom{color:var(--color-card-black)}
+.card-empty-icon{color:var(--color-text-faint);font-size:1.4rem}
+.card-plus{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:1.5rem;color:var(--color-text-faint)}
+
+/* PICKER MODAL */
+.picker-overlay{position:fixed;inset:0;background:oklch(.1 0 0/.6);z-index:200;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);opacity:0;pointer-events:none;transition:opacity var(--transition)}
+.picker-overlay.open{opacity:1;pointer-events:all}
+.picker-panel{background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-xl);padding:var(--space-6);width:min(560px,95vw);box-shadow:0 16px 48px oklch(0 0 0/.35);transform:scale(.95);transition:transform var(--transition)}
+.picker-overlay.open .picker-panel{transform:scale(1)}
+.picker-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--space-5)}
+.picker-title{font-size:var(--text-base);font-weight:700}
+.picker-close{background:none;border:none;color:var(--color-text-muted);cursor:pointer;font-size:1.3rem;padding:var(--space-1);border-radius:var(--radius-sm);transition:color var(--transition)}
+.picker-close:hover{color:var(--color-text)}
+.suit-tabs{display:flex;gap:var(--space-2);margin-bottom:var(--space-4)}
+.suit-tab{flex:1;padding:var(--space-2) var(--space-3);border:1px solid var(--color-border);border-radius:var(--radius-md);cursor:pointer;font-size:1.2rem;transition:all var(--transition);background:var(--color-surface-2);text-align:center}
+.suit-tab:hover{border-color:var(--color-primary)}
+.suit-tab.active{border-color:var(--color-primary);background:color-mix(in oklch,var(--color-primary) 12%,var(--color-surface-2))}
+.suit-tab.red-suit{color:var(--color-card-red)}
+.suit-tab.black-suit{color:var(--color-card-black)}
+.ranks-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:var(--space-2)}
+.rank-btn{padding:var(--space-2);border:1px solid var(--color-border);border-radius:var(--radius-md);cursor:pointer;font-size:var(--text-sm);font-weight:700;background:var(--color-surface-2);transition:all var(--transition);text-align:center}
+.rank-btn:hover:not(:disabled){border-color:var(--color-primary);background:color-mix(in oklch,var(--color-primary) 10%,var(--color-surface-2))}
+.rank-btn:disabled{opacity:.3;cursor:not-allowed}
+.rank-btn.red-rank{color:var(--color-card-red)}
+.rank-btn.black-rank{color:var(--color-card-black)}
+.picker-clear{width:100%;margin-top:var(--space-4);padding:var(--space-2) var(--space-4);border:1px solid var(--color-border);border-radius:var(--radius-md);background:none;color:var(--color-text-muted);cursor:pointer;font-size:var(--text-sm);transition:all var(--transition)}
+.picker-clear:hover{border-color:var(--color-error);color:var(--color-error)}
+
+/* SETTINGS */
+.settings-grid{display:grid;gap:var(--space-4)}
+.field{display:flex;flex-direction:column;gap:var(--space-2)}
+.field label{font-size:var(--text-xs);font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--color-text-muted)}
+.field input[type=range]{accent-color:var(--color-primary);width:100%}
+.field-row{display:flex;align-items:center;justify-content:space-between;gap:var(--space-4)}
+.field-value{font-size:var(--text-sm);font-weight:700;color:var(--color-primary);min-width:2rem;text-align:right}
+.select-input{width:100%;padding:var(--space-2) var(--space-3);background:var(--color-surface-2);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text);font-size:var(--text-sm);appearance:none;cursor:pointer;transition:border-color var(--transition)}
+.select-input:focus{outline:none;border-color:var(--color-primary)}
+
+/* RUN BUTTON */
+.btn-run{width:100%;padding:var(--space-4) var(--space-6);background:var(--color-primary);color:#fff;border:none;border-radius:var(--radius-lg);font-size:var(--text-base);font-weight:700;cursor:pointer;transition:all var(--transition);letter-spacing:.02em;margin-top:var(--space-2)}
+.btn-run:hover{background:var(--color-primary-hover);transform:translateY(-1px);box-shadow:0 4px 12px oklch(.4 .1 192/.3)}
+.btn-run:active{transform:none}
+.btn-run:disabled{opacity:.5;cursor:not-allowed;transform:none}
+
+/* RESULTS */
+.result-panel{display:flex;flex-direction:column;gap:var(--space-5)}
+.result-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:var(--space-12) var(--space-6);color:var(--color-text-faint);text-align:center;gap:var(--space-3)}
+.result-empty-icon{font-size:3rem;opacity:.4}
+.win-rate-display{text-align:center;padding:var(--space-6);background:var(--color-surface-2);border-radius:var(--radius-lg);border:1px solid var(--color-border)}
+.win-rate-label{font-size:var(--text-xs);font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--color-text-muted);margin-bottom:var(--space-2)}
+.win-rate-number{font-size:var(--text-xl);font-weight:700;color:var(--color-primary);line-height:1}
+.win-rate-sub{font-size:var(--text-sm);color:var(--color-text-muted);margin-top:var(--space-2)}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:var(--space-3)}
+.stat-card{background:var(--color-surface-2);border:1px solid var(--color-border);border-radius:var(--radius-md);padding:var(--space-4);text-align:center}
+.stat-label{font-size:var(--text-xs);color:var(--color-text-muted);margin-bottom:var(--space-1);text-transform:uppercase;letter-spacing:.07em}
+.stat-value{font-size:var(--text-lg);font-weight:700}
+.stat-value.win{color:var(--color-success)}
+.stat-value.tie{color:var(--color-gold)}
+.stat-value.lose{color:var(--color-error)}
+
+/* HAND BREAKDOWN */
+.breakdown-title{font-size:var(--text-xs);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--color-text-muted);margin-bottom:var(--space-3)}
+.breakdown-list{display:flex;flex-direction:column;gap:var(--space-2)}
+.breakdown-item{display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:var(--space-3)}
+.breakdown-name{font-size:var(--text-sm)}
+.breakdown-bar-wrap{height:6px;background:var(--color-surface-offset);border-radius:9999px;overflow:hidden;flex:1}
+.breakdown-bar{height:100%;border-radius:9999px;background:var(--color-primary);transition:width .6s cubic-bezier(.16,1,.3,1)}
+.breakdown-pct{font-size:var(--text-xs);font-weight:700;color:var(--color-text-muted);min-width:3rem;text-align:right}
+.breakdown-item-full{grid-template-columns:auto 1fr auto;gap:var(--space-3);align-items:center}
+
+/* ADVICE */
+.advice-box{background:color-mix(in oklch,var(--color-primary) 8%,var(--color-surface));border:1px solid color-mix(in oklch,var(--color-primary) 30%,var(--color-border));border-radius:var(--radius-lg);padding:var(--space-5)}
+.advice-header{font-size:var(--text-xs);font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--color-primary);margin-bottom:var(--space-2)}
+.advice-action{font-size:var(--text-lg);font-weight:700;margin-bottom:var(--space-2)}
+.advice-reason{font-size:var(--text-sm);color:var(--color-text-muted);line-height:1.5}
+
+/* PROGRESS */
+.progress-bar{height:4px;background:var(--color-surface-offset);border-radius:9999px;overflow:hidden;margin-top:var(--space-3)}
+.progress-fill{height:100%;background:var(--color-primary);border-radius:9999px;transition:width .3s ease;width:0%}
+
+/* JSON IMPORT */
+.import-area{margin-top:var(--space-4);padding:var(--space-4);background:var(--color-surface-2);border:1px dashed var(--color-border);border-radius:var(--radius-md)}
+.import-label{font-size:var(--text-xs);font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--color-text-muted);margin-bottom:var(--space-2)}
+.import-textarea{width:100%;height:80px;background:var(--color-bg);border:1px solid var(--color-border);border-radius:var(--radius-sm);color:var(--color-text);font-size:var(--text-xs);font-family:monospace;padding:var(--space-2);resize:vertical;transition:border-color var(--transition)}
+.import-textarea:focus{outline:none;border-color:var(--color-primary)}
+.btn-import{padding:var(--space-2) var(--space-4);background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-muted);font-size:var(--text-sm);cursor:pointer;margin-top:var(--space-2);transition:all var(--transition)}
+.btn-import:hover{border-color:var(--color-primary);color:var(--color-primary)}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-brand">
+      <div class="logo">
+        <svg width="32" height="32" viewBox="0 0 32 32" fill="none" aria-label="Poker Advisor">
+          <rect width="32" height="32" rx="8" fill="currentColor" opacity=".1"/>
+          <text x="16" y="22" text-anchor="middle" font-size="18" font-weight="700" fill="currentColor">&#9824;</text>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">Hold'em Advisor</div>
+        <div class="brand-sub">Monte Carlo Simulator</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="btn-icon" data-theme-toggle aria-label="Toggle theme">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- LEFT: INPUT -->
+    <div style="display:flex;flex-direction:column;gap:var(--space-5)">
+
+      <!-- MY HOLE CARDS -->
+      <div class="section-card">
+        <div class="section-title">&#128100; 我的手牌 (Hole Cards)</div>
+        <div class="card-row" id="holeRow">
+          <div class="playing-card empty" data-slot="hole-0" tabindex="0" role="button" aria-label="選擇手牌 1">
+            <span class="card-plus">+</span>
+          </div>
+          <div class="playing-card empty" data-slot="hole-1" tabindex="0" role="button" aria-label="選擇手牌 2">
+            <span class="card-plus">+</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- BOARD -->
+      <div class="section-card">
+        <div class="section-title">&#127183; 公共牌 (Board)</div>
+        <div style="display:flex;flex-direction:column;gap:var(--space-4)">
+          <div>
+            <div class="card-group-label">Flop</div>
+            <div class="card-row" id="boardFlopRow">
+              <div class="playing-card empty" data-slot="board-0" tabindex="0" role="button"><span class="card-plus">+</span></div>
+              <div class="playing-card empty" data-slot="board-1" tabindex="0" role="button"><span class="card-plus">+</span></div>
+              <div class="playing-card empty" data-slot="board-2" tabindex="0" role="button"><span class="card-plus">+</span></div>
+            </div>
+          </div>
+          <div>
+            <div class="card-group-label">Turn</div>
+            <div class="card-row" id="boardTurnRow">
+              <div class="playing-card empty" data-slot="board-3" tabindex="0" role="button"><span class="card-plus">+</span></div>
+            </div>
+          </div>
+          <div>
+            <div class="card-group-label">River</div>
+            <div class="card-row" id="boardRiverRow">
+              <div class="playing-card empty" data-slot="board-4" tabindex="0" role="button"><span class="card-plus">+</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- JSON IMPORT -->
+      <div class="section-card">
+        <div class="section-title">&#128229; screen_reader.py 輸出匯入</div>
+        <div class="import-area">
+          <div class="import-label">貼上 last_read.json 內容</div>
+          <textarea class="import-textarea" id="jsonImport" placeholder='{"hole":["A♥","K♠"],"board":["Q♥","J♦","T♣"]}'></textarea>
+          <button class="btn-import" id="btnImport">&#9654; 匯入並填入牌面</button>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT: SETTINGS + RESULTS -->
+    <div style="display:flex;flex-direction:column;gap:var(--space-5)">
+
+      <!-- SETTINGS -->
+      <div class="section-card">
+        <div class="section-title">&#9881; 模擬設定</div>
+        <div class="settings-grid">
+          <div class="field">
+            <div class="field-row">
+              <label for="numPlayers">玩家人數</label>
+              <span class="field-value" id="numPlayersVal">6</span>
+            </div>
+            <input type="range" id="numPlayers" min="2" max="9" value="6" step="1">
+          </div>
+          <div class="field">
+            <div class="field-row">
+              <label for="numSims">模擬次數</label>
+              <span class="field-value" id="numSimsVal">10,000</span>
+            </div>
+            <input type="range" id="numSims" min="1000" max="50000" value="10000" step="1000">
+          </div>
+          <div class="field">
+            <label for="position">我的位置</label>
+            <select class="select-input" id="position">
+              <option value="early">Early (UTG / UTG+1)</option>
+              <option value="middle" selected>Middle (MP)</option>
+              <option value="late">Late (CO / BTN)</option>
+              <option value="blind">Blind (SB / BB)</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn-run" id="btnRun" disabled>&#9654; 執行模擬</button>
+        <div class="progress-bar" id="progressBar" style="display:none">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+      </div>
+
+      <!-- RESULTS -->
+      <div class="section-card" id="resultsCard">
+        <div class="section-title">&#128202; 模擬結果</div>
+        <div id="resultContent">
+          <div class="result-empty">
+            <div class="result-empty-icon">&#9824;</div>
+            <div>選好手牌後執行模擬</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+</div>
+
+<!-- CARD PICKER MODAL -->
+<div class="picker-overlay" id="pickerOverlay" role="dialog" aria-modal="true" aria-label="選牌">
+  <div class="picker-panel">
+    <div class="picker-header">
+      <div class="picker-title" id="pickerTitle">選擇牌面</div>
+      <button class="picker-close" id="pickerClose" aria-label="關閉">&#10005;</button>
+    </div>
+    <div class="suit-tabs" id="suitTabs">
+      <button class="suit-tab red-suit active" data-suit="h">&#9829; Hearts</button>
+      <button class="suit-tab red-suit" data-suit="d">&#9830; Diamonds</button>
+      <button class="suit-tab black-suit" data-suit="c">&#9827; Clubs</button>
+      <button class="suit-tab black-suit" data-suit="s">&#9824; Spades</button>
+    </div>
+    <div class="ranks-grid" id="ranksGrid"></div>
+    <button class="picker-clear" id="pickerClear">&#128465; 清除此張牌</button>
+  </div>
+</div>
+
+<script>
+// ===== CONSTANTS =====
+const RANKS = ['A','K','Q','J','T','9','8','7','6','5','4','3','2'];
+const SUITS = [
+  {id:'h', sym:'\u2665', cls:'red'},
+  {id:'d', sym:'\u2666', cls:'red'},
+  {id:'c', sym:'\u2663', cls:'black'},
+  {id:'s', sym:'\u2660', cls:'black'}
+];
+const SUIT_MAP = {'h': SUITS[0], 'd': SUITS[1], 'c': SUITS[2], 's': SUITS[3]};
+const RANKS_VAL = {A:14,K:13,Q:12,J:11,T:10,9:9,8:8,7:7,6:6,5:5,4:4,3:3,2:2};
+
+// ===== STATE =====
+const cards = {hole:[null,null], board:[null,null,null,null,null]};
+let activeSlot = null;
+let activeSuit = 'h';
+let simRunning = false;
+
+// ===== DECK UTILITIES =====
+function buildDeck() {
+  const deck = [];
+  for (const s of SUITS) for (const r of RANKS) deck.push({rank:r, suit:s.id});
+  return deck;
+}
+function shuffle(arr) {
+  for (let i = arr.length-1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i+1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+function cardStr(c) { return c.rank + c.suit; }
+function usedCards() {
+  return [
+    ...cards.hole.filter(Boolean),
+    ...cards.board.filter(Boolean)
+  ].map(c => c.rank + c.suit);
+}
+
+// ===== HAND EVALUATOR =====
+const HAND_NAMES = ['High Card','One Pair','Two Pair','Three of a Kind','Straight','Flush','Full House','Four of a Kind','Straight Flush','Royal Flush'];
+
+function evalHand(hand) {
+  const ranks = hand.map(c => RANKS_VAL[c.rank]).sort((a,b)=>b-a);
+  const suits = hand.map(c => c.suit);
+  const rankCount = {};
+  ranks.forEach(r => rankCount[r] = (rankCount[r]||0) + 1);
+  const counts = Object.values(rankCount).sort((a,b)=>b-a);
+  const isFlush = new Set(suits).size === 1;
+  const sortedR = [...new Set(ranks)].sort((a,b)=>b-a);
+  let isStraight = false;
+  if (sortedR.length === 5 && sortedR[0] - sortedR[4] === 4) isStraight = true;
+  if (JSON.stringify(sortedR) === JSON.stringify([14,5,4,3,2])) { isStraight = true; sortedR[0] = 5; sortedR.sort((a,b)=>b-a); }
+  if (isStraight && isFlush) return {rank: sortedR[0]===14 ? 9 : 8, tiebreak: sortedR};
+  if (counts[0]===4) return {rank:7, tiebreak:ranks};
+  if (counts[0]===3 && counts[1]===2) return {rank:6, tiebreak:ranks};
+  if (isFlush) return {rank:5, tiebreak:ranks};
+  if (isStraight) return {rank:4, tiebreak:sortedR};
+  if (counts[0]===3) return {rank:3, tiebreak:ranks};
+  if (counts[0]===2 && counts[1]===2) return {rank:2, tiebreak:ranks};
+  if (counts[0]===2) return {rank:1, tiebreak:ranks};
+  return {rank:0, tiebreak:ranks};
+}
+
+function bestOf7(sevenCards) {
+  let best = null;
+  for (let i=0;i<7;i++) for (let j=i+1;j<7;j++) {
+    const five = sevenCards.filter((_,k)=>k!==i&&k!==j);
+    const ev = evalHand(five);
+    if (!best || compareHand(ev, best) > 0) best = ev;
+  }
+  return best;
+}
+
+function compareHand(a, b) {
+  if (a.rank !== b.rank) return a.rank - b.rank;
+  for (let i=0;i<Math.min(a.tiebreak.length,b.tiebreak.length);i++) {
+    if (a.tiebreak[i] !== b.tiebreak[i]) return a.tiebreak[i] - b.tiebreak[i];
+  }
+  return 0;
+}
+
+// ===== MONTE CARLO SIMULATION =====
+function runSimulation(holeCards, boardCards, numPlayers, numSims) {
+  const wins = new Array(numPlayers).fill(0);
+  const ties = new Array(numPlayers).fill(0);
+  const handCounts = new Array(10).fill(0);
+  const knownBoard = boardCards.filter(Boolean);
+  const knownBoardLen = knownBoard.length;
+  const usedSet = new Set([
+    ...holeCards.map(cardStr),
+    ...knownBoard.map(cardStr)
+  ]);
+  const baseDeck = buildDeck().filter(c => !usedSet.has(cardStr(c)));
+  for (let sim=0; sim<numSims; sim++) {
+    const deck = shuffle([...baseDeck]);
+    let di = 0;
+    const fullBoard = [...knownBoard];
+    while (fullBoard.length < 5) fullBoard.push(deck[di++]);
+    const oppHands = [];
+    for (let p=1; p<numPlayers; p++) {
+      oppHands.push([deck[di++], deck[di++]]);
+    }
+    const myBest = bestOf7([...holeCards, ...fullBoard]);
+    handCounts[myBest.rank]++;
+    let myWin = true;
+    let myTie = false;
+    const playerResults = [{best:myBest, idx:0}];
+    for (let p=0;p<oppHands.length;p++) {
+      const ob = bestOf7([...oppHands[p], ...fullBoard]);
+      playerResults.push({best:ob, idx:p+1});
+    }
+    playerResults.sort((a,b)=>-compareHand(a.best,b.best));
+    const topRank = playerResults[0].best;
+    const winners = playerResults.filter(pr=>compareHand(pr.best,topRank)===0);
+    if (winners.length > 1 && winners.some(w=>w.idx===0)) {
+      ties[0]++;
+    } else if (winners.length === 1 && winners[0].idx === 0) {
+      wins[0]++;
+    }
+  }
+  const winRate = wins[0] / numSims;
+  const tieRate = ties[0] / numSims;
+  const loseRate = 1 - winRate - tieRate;
+  return {
+    winRate, tieRate, loseRate,
+    handCounts: handCounts.map(c=>c/numSims),
+    numSims
+  };
+}
+
+function getAdvice(winRate, holeCards, boardCards, position, numPlayers) {
+  const stage = boardCards.filter(Boolean).length;
+  const stageLabel = stage===0?'Pre-Flop':stage===3?'Flop':stage===4?'Turn':'River';
+  const posAdj = position==='late'?0.05:position==='early'?-0.05:0;
+  const adjusted = winRate + posAdj;
+  let action, reason;
+  if (adjusted > 0.65) {
+    action = '&#128308; 強勢加注 (Raise / 3-Bet)';
+    reason = `${stageLabel} 勝率 ${(winRate*100).toFixed(1)}% 極佳，${position==='late'?'位置有利，':''}主動加壓對手。`;
+  } else if (adjusted > 0.50) {
+    action = '&#128992; 跟注/加注 (Call / Raise)';
+    reason = `勝率 ${(winRate*100).toFixed(1)}%，正EV。${position==='early'?'Early position 建議適度加注而非limp。':'可視對手行動決定加碼幅度。'}`;
+  } else if (adjusted > 0.38) {
+    action = '&#128993; 謹慎跟注 (Cautious Call)';
+    reason = `勝率 ${(winRate*100).toFixed(1)}%，邊際。建議留意對手行為，避免大金額投入。`;
+  } else {
+    action = '&#128994; 棄牌 (Fold)';
+    reason = `勝率 ${(winRate*100).toFixed(1)}%，低於期望。${numPlayers>5?'多人局更難獲勝，':''}建議棄牌保留籌碼。`;
+  }
+  return {action, reason};
+}
+
+// ===== UI RENDERING =====
+function renderCard(slot, card) {
+  const el = document.querySelector(`[data-slot="${slot}"]`);
+  if (!el) return;
+  if (!card) {
+    el.className = 'playing-card empty';
+    el.innerHTML = '<span class="card-plus">+</span>';
+    return;
+  }
+  const suitInfo = SUIT_MAP[card.suit];
+  el.className = `playing-card card-${suitInfo.cls}`;
+  el.innerHTML = `
+    <span class="card-rank">${card.rank}</span>
+    <span class="card-suit">${suitInfo.sym}</span>
+    <span class="card-rank-bottom">${card.rank}</span>
+  `;
+}
+
+function renderAllCards() {
+  cards.hole.forEach((c,i) => renderCard(`hole-${i}`, c));
+  cards.board.forEach((c,i) => renderCard(`board-${i}`, c));
+}
+
+function updateRunBtn() {
+  const hasHole = cards.hole.every(Boolean);
+  document.getElementById('btnRun').disabled = !hasHole || simRunning;
+}
+
+function renderResults(result, numPlayers, position) {
+  const {winRate, tieRate, loseRate, handCounts, numSims} = result;
+  const advice = getAdvice(winRate, cards.hole, cards.board, position, numPlayers);
+  const pct = n => (n*100).toFixed(1) + '%';
+  document.getElementById('resultContent').innerHTML = `
+    <div class="result-panel">
+      <div class="win-rate-display">
+        <div class="win-rate-label">勝率 Win Rate</div>
+        <div class="win-rate-number">${pct(winRate)}</div>
+        <div class="win-rate-sub">${numSims.toLocaleString()} 次模擬 | ${numPlayers} 人局</div>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">Win</div>
+          <div class="stat-value win">${pct(winRate)}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Tie</div>
+          <div class="stat-value tie">${pct(tieRate)}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Lose</div>
+          <div class="stat-value lose">${pct(loseRate)}</div>
+        </div>
+      </div>
+      <div>
+        <div class="breakdown-title">我的手牌組成分布</div>
+        <div class="breakdown-list">
+          ${HAND_NAMES.slice().reverse().map((name,i)=>{
+            const idx = 9-i;
+            const pctVal = handCounts[idx];
+            if(pctVal < 0.005) return '';
+            return `
+              <div class="breakdown-item">
+                <span class="breakdown-name">${name}</span>
+                <div style="flex:1;height:6px;background:var(--color-surface-offset);border-radius:9999px;overflow:hidden">
+                  <div style="height:100%;width:${(pctVal*100).toFixed(1)}%;background:var(--color-primary);border-radius:9999px;transition:width .6s cubic-bezier(.16,1,.3,1)"></div>
+                </div>
+                <span class="breakdown-pct">${pct(pctVal)}</span>
+              </div>`;
+          }).join('')}
+        </div>
+      </div>
+      <div class="advice-box">
+        <div class="advice-header">&#9889; AI 建議</div>
+        <div class="advice-action">${advice.action}</div>
+        <div class="advice-reason">${advice.reason}</div>
+      </div>
+    </div>
+  `;
+}
+
+// ===== PICKER LOGIC =====
+function openPicker(slot) {
+  activeSlot = slot;
+  activeSuit = 'h';
+  document.getElementById('pickerTitle').textContent =
+    slot.startsWith('hole') ? `選擇手牌 ${parseInt(slot.split('-')[1])+1}` : `選擇公共牌 ${parseInt(slot.split('-')[1])+1}`;
+  updateSuitTabs();
+  updateRanksGrid();
+  document.getElementById('pickerOverlay').classList.add('open');
+}
+
+function closePicker() {
+  document.getElementById('pickerOverlay').classList.remove('open');
+  activeSlot = null;
+}
+
+function updateSuitTabs() {
+  document.querySelectorAll('.suit-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.suit === activeSuit);
+  });
+}
+
+function updateRanksGrid() {
+  const used = usedCards();
+  const suitInfo = SUIT_MAP[activeSuit];
+  const grid = document.getElementById('ranksGrid');
+  grid.innerHTML = RANKS.map(r => {
+    const cs = r + activeSuit;
+    const isUsed = used.includes(cs);
+    const isCurrent = activeSlot && cards[
+      activeSlot.startsWith('hole') ? 'hole' : 'board'
+    ][parseInt(activeSlot.split('-')[1])];
+    const isSelf = isCurrent && cardStr(isCurrent) === cs;
+    return `<button class="rank-btn ${suitInfo.cls==='red'?'red-rank':'black-rank'}" data-rank="${r}" ${isUsed && !isSelf ? 'disabled' : ''} title="${r}${suitInfo.sym}">${r}</button>`;
+  }).join('');
+}
+
+document.querySelectorAll('.suit-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    activeSuit = btn.dataset.suit;
+    updateSuitTabs();
+    updateRanksGrid();
+  });
+});
+
+document.getElementById('ranksGrid').addEventListener('click', e => {
+  const btn = e.target.closest('.rank-btn');
+  if (!btn || btn.disabled || !activeSlot) return;
+  const [type, idx] = activeSlot.split('-');
+  const cardObj = {rank: btn.dataset.rank, suit: activeSuit};
+  if (type === 'hole') cards.hole[parseInt(idx)] = cardObj;
+  else cards.board[parseInt(idx)] = cardObj;
+  renderAllCards();
+  updateRunBtn();
+  closePicker();
+});
+
+document.getElementById('pickerClear').addEventListener('click', () => {
+  if (!activeSlot) return;
+  const [type, idx] = activeSlot.split('-');
+  if (type === 'hole') cards.hole[parseInt(idx)] = null;
+  else cards.board[parseInt(idx)] = null;
+  renderAllCards();
+  updateRunBtn();
+  closePicker();
+});
+
+document.getElementById('pickerClose').addEventListener('click', closePicker);
+document.getElementById('pickerOverlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('pickerOverlay')) closePicker();
+});
+
+document.querySelectorAll('[data-slot]').forEach(el => {
+  el.addEventListener('click', () => openPicker(el.dataset.slot));
+  el.addEventListener('keydown', e => { if(e.key==='Enter'||e.key===' ') openPicker(el.dataset.slot); });
+});
+
+// ===== SETTINGS SLIDERS =====
+document.getElementById('numPlayers').addEventListener('input', e => {
+  document.getElementById('numPlayersVal').textContent = e.target.value;
+});
+document.getElementById('numSims').addEventListener('input', e => {
+  document.getElementById('numSimsVal').textContent = parseInt(e.target.value).toLocaleString();
+});
+
+// ===== RUN SIMULATION =====
+document.getElementById('btnRun').addEventListener('click', async () => {
+  if (simRunning || !cards.hole.every(Boolean)) return;
+  simRunning = true;
+  const btn = document.getElementById('btnRun');
+  btn.disabled = true;
+  btn.textContent = '⏳ 模擬中...';
+  const progress = document.getElementById('progressBar');
+  const fill = document.getElementById('progressFill');
+  progress.style.display = 'block';
+  fill.style.width = '0%';
+  const numPlayers = parseInt(document.getElementById('numPlayers').value);
+  const numSims = parseInt(document.getElementById('numSims').value);
+  const position = document.getElementById('position').value;
+  // Animate progress
+  let prog = 0;
+  const progInt = setInterval(() => {
+    prog = Math.min(prog + Math.random()*15, 90);
+    fill.style.width = prog + '%';
+  }, 80);
+  await new Promise(r => setTimeout(r, 30));
+  const result = runSimulation(cards.hole, cards.board, numPlayers, numSims);
+  clearInterval(progInt);
+  fill.style.width = '100%';
+  setTimeout(() => { progress.style.display='none'; fill.style.width='0%'; }, 600);
+  renderResults(result, numPlayers, position);
+  simRunning = false;
+  btn.disabled = false;
+  btn.innerHTML = '&#9654; 執行模擬';
+});
+
+// ===== JSON IMPORT =====
+document.getElementById('btnImport').addEventListener('click', () => {
+  try {
+    const raw = document.getElementById('jsonImport').value.trim();
+    const data = JSON.parse(raw);
+    const suitCharMap = {'♥':'h','♦':'d','♣':'c','♠':'s','h':'h','d':'d','c':'c','s':'s'};
+    function parseCardStr(str) {
+      if(!str||str.length<2) return null;
+      const rank = str[0].toUpperCase()==='1'&&str[1]==='0'?'T':
+        str[0].toUpperCase()==='T'?'T':str[0].toUpperCase();
+      const suitRaw = str.slice(-1);
+      const suit = suitCharMap[suitRaw] || 's';
+      return {rank, suit};
+    }
+    if(data.hole) data.hole.forEach((cs,i)=>{ if(i<2) cards.hole[i]=parseCardStr(cs); });
+    if(data.board) data.board.forEach((cs,i)=>{ if(i<5) cards.board[i]=parseCardStr(cs); });
+    renderAllCards();
+    updateRunBtn();
+    alert('✓ 匯入成功！請確認牌面後執行模擬。');
+  } catch(e) {
+    alert('JSON 格式錯誤，請確認內容。');
+  }
+});
+
+// ===== THEME TOGGLE =====
+(function(){
+  const t=document.querySelector('[data-theme-toggle]'),r=document.documentElement;
+  let d=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';
+  r.setAttribute('data-theme',d);
+  t&&t.addEventListener('click',()=>{
+    d=d==='dark'?'light':'dark';
+    r.setAttribute('data-theme',d);
+    t.innerHTML=d==='dark'?'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>':'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>';
+  });
+})();
+</script>
+</body>
+</html>
