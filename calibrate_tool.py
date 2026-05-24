@@ -16,8 +16,9 @@ calibrate_tool.py  —  GameSofa 辨識區塊拖拉校正工具
 
 截圖說明
 --------
-使用 GetClientRect + ClientToScreen 只截取瀏覽器「內容區」，
-排除標題列、網址列、書籤列，與 screen_reader.py 的截圖基準完全一致。
+直接對 hwnd 的 client DC 做 BitBlt，只截網頁內容區，
+不含標題列/網址列/書籤列，且不受最大化視窗的負座標影響。
+與 screen_reader.py 的截圖基準完全一致。
 
 鍵盤快捷鍵:
   Delete / Backspace → 還原選取框到原始座標
@@ -302,62 +303,46 @@ def _refresh_window_list(lb, windows_ref, info_var):
 
 def capture_hwnd(hwnd):
     """
-    只截取 hwnd 的 client area（不含標題列/網址列/書籤列）。
-    使用 PrintWindow 背景截圖 + GetClientRect/ClientToScreen 取得正確範圍。
-    與 screen_reader.py 的截圖基準完全一致。
+    直接對 hwnd 的 client DC 做 BitBlt 截圖。
+    - 只截 client area（不含標題列/網址列/書籤列）
+    - 不使用 GetWindowRect，不受最大化視窗負座標影響
+    - 不需要 crop 計算
+    與 screen_reader.py 的 _capture_client_bitblt 完全一致。
     """
     try:
-        import win32gui, win32ui
-        from ctypes import windll, wintypes
+        import win32gui, win32ui, win32con
 
-        # 取得 client area 大小（相對座標）
+        # GetClientRect 取得 client 寬高
         client_rect = win32gui.GetClientRect(hwnd)
         cw = client_rect[2] - client_rect[0]
         ch = client_rect[3] - client_rect[1]
         if cw <= 0 or ch <= 0:
             return None
 
-        # ClientToScreen: client (0,0) → 螢幕絕對座標
-        pt = wintypes.POINT(0, 0)
-        windll.user32.ClientToScreen(hwnd, pt)
-        client_left, client_top = pt.x, pt.y
-
-        # 取整個視窗大小用於 PrintWindow
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        ww, wh = right - left, bottom - top
-        if ww <= 0 or wh <= 0:
-            return None
-
-        # PrintWindow 截整個視窗
-        hwnd_dc = win32gui.GetWindowDC(hwnd)
-        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
-        save_dc = mfc_dc.CreateCompatibleDC()
+        # 取得 client DC（對應網頁內容區）
+        client_dc = win32gui.GetDC(hwnd)
+        mfc_dc    = win32ui.CreateDCFromHandle(client_dc)
+        save_dc   = mfc_dc.CreateCompatibleDC()
         bmp = win32ui.CreateBitmap()
-        bmp.CreateCompatibleBitmap(mfc_dc, ww, wh)
+        bmp.CreateCompatibleBitmap(mfc_dc, cw, ch)
         save_dc.SelectObject(bmp)
-        result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
-        if result == 0:
-            result = windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 1)
+
+        # BitBlt 從 client DC 複製到 save_dc（不含視窗邊框/標題列）
+        save_dc.BitBlt((0, 0), (cw, ch), mfc_dc, (0, 0), win32con.SRCCOPY)
+
         info = bmp.GetInfo()
         data = bmp.GetBitmapBits(True)
-        full_img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), data, "raw", "BGRX", 0, 1)
+        img = Image.frombuffer("RGB", (info["bmWidth"], info["bmHeight"]), data, "raw", "BGRX", 0, 1)
         win32gui.DeleteObject(bmp.GetHandle())
         save_dc.DeleteDC()
         mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, hwnd_dc)
+        win32gui.ReleaseDC(hwnd, client_dc)
 
-        if result == 0:
-            return None
-
-        # 裁切出 client area（相對於視窗左上角的偏移）
-        offset_x = client_left - left
-        offset_y = client_top  - top
-        client_img = full_img.crop((offset_x, offset_y, offset_x + cw, offset_y + ch))
-        print(f"[INFO] client area: {cw}×{ch}  (視窗偏移 dx={offset_x} dy={offset_y})")
-        return client_img
+        print(f"[INFO] client area (BitBlt): {cw}×{ch}")
+        return img
 
     except Exception as e:
-        print(f"[WARN] PrintWindow 失敗: {e}")
+        print(f"[WARN] BitBlt 截圖失敗: {e}")
         return None
 
 
