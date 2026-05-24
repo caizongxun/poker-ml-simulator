@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GameSofa Texas Hold'em Screen Reader v7
+GameSofa Texas Hold'em Screen Reader v8
 =========================================
 F6 → 校正模式 (存 debug_crops/ 並印出實際尺寸，方便微調座標)
 F7 → 切換自動輪詢
@@ -14,13 +14,17 @@ REGIONS_REL 用比例座標 (0.0~1.0)，啟動時會優先讀取 regions.json。
 若 regions.json 不存在才使用程式內 hardcode 預設值。
 用 calibrate_tool.py 調整後儲存，即可同步到此程式。
 
-截圖說明
+截圖說明 (v8)
 --------
-直接對 hwnd 的 client DC 做 BitBlt，只截網頁內容區，
-不含標題列/網址列/書籤列，且不受最大化視窗的負座標影響。
+使用 PrintWindow + PW_RENDERFULLCONTENT (flag=2) 截圖：
+- 強制捕捉 GPU/DirectComposition 合成內容（Edge/Chrome 不黑屏）
+- 搭配 DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) 取得真實視覺邊框
+- 再用 ClientToScreen 定位 client area 在視覺邊框內的偏移
+- 正確裁剪出純網頁內容區，不含標題列/網址列/書籤列
+- 最大化視窗也正確處理（無負座標問題）
 """
 
-import sys, os, time, json, subprocess, tempfile, threading
+import sys, os, time, json, subprocess, tempfile, threading, ctypes
 from pathlib import Path
 
 # ── Optional imports ──────────────────────────────────────────
@@ -57,55 +61,134 @@ if sys.platform == "win32":
 from PIL import Image, ImageDraw
 
 # ─────────────────────────────────────────────────────────────
-# WINDOW CAPTURE
+# WINDOW CAPTURE — PrintWindow + PW_RENDERFULLCONTENT
 # ─────────────────────────────────────────────────────────────
 WINDOW_KEYWORDS = ["gamesofa", "神來也", "texas", "德州", "poker",
                    "chrome", "firefox", "edge", "msedge"]
 
+# ctypes 結構
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
-def _capture_client_bitblt(hwnd):
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
+PW_RENDERFULLCONTENT = 2  # 強制捕捉 GPU 合成內容，Edge/Chrome 必要
+
+
+def _get_visual_rect(hwnd):
     """
-    直接對 hwnd 的 client DC 做 BitBlt 截圖。
-    - 只截 client area（不含標題列/網址列/書籤列）
-    - 不使用 GetWindowRect，不受最大化視窗負座標影響
-    - 不需要 crop 計算
-    回傳 PIL.Image 或 None。
+    用 DwmGetWindowAttribute 取得視窗的真實視覺邊框（排除最大化時的超出偏移）。
+    回傳 (left, top, right, bottom) 螢幕座標，失敗則回傳 None。
     """
     try:
-        # GetClientRect 取得 client 寬高
-        client_rect = win32gui.GetClientRect(hwnd)
-        cw = client_rect[2] - client_rect[0]
-        ch = client_rect[3] - client_rect[1]
-        if cw <= 0 or ch <= 0:
+        rect = _RECT()
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(rect),
+            ctypes.sizeof(rect)
+        )
+        if hr == 0:  # S_OK
+            return (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception as e:
+        print(f"[WARN] DwmGetWindowAttribute 失敗: {e}")
+    return None
+
+
+def _capture_printwindow(hwnd):
+    """
+    用 PrintWindow + PW_RENDERFULLCONTENT 截取視窗（含 GPU 合成內容），
+    再用 DwmGetWindowAttribute + ClientToScreen 正確裁剪出 client area。
+
+    流程：
+    1. PrintWindow 截整個視窗（含邊框/標題列），大小為 GetWindowRect 的尺寸
+    2. DwmGetWindowAttribute 取視覺邊框（修正最大化時 GetWindowRect 的負偏移）
+    3. ClientToScreen(0,0) 取 client area 左上角的螢幕座標
+    4. client origin - visual rect origin = crop offset
+    5. crop 出純 client area
+
+    回傳 PIL.Image（只含網頁內容區）或 None。
+    """
+    try:
+        # Step 1: 取 GetWindowRect（用於 PrintWindow bitmap 尺寸）
+        win_rect = win32gui.GetWindowRect(hwnd)
+        win_w = win_rect[2] - win_rect[0]
+        win_h = win_rect[3] - win_rect[1]
+        if win_w <= 0 or win_h <= 0:
             return None
 
-        # 取得 client DC（對應網頁內容區）
-        client_dc  = win32gui.GetDC(hwnd)
-        mfc_dc     = win32ui.CreateDCFromHandle(client_dc)
-        save_dc    = mfc_dc.CreateCompatibleDC()
-        bitmap     = win32ui.CreateBitmap()
-        bitmap.CreateCompatibleBitmap(mfc_dc, cw, ch)
+        # Step 2: 建立 bitmap，用 window DC
+        win_dc   = win32gui.GetWindowDC(hwnd)
+        mfc_dc   = win32ui.CreateDCFromHandle(win_dc)
+        save_dc  = mfc_dc.CreateCompatibleDC()
+        bitmap   = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(mfc_dc, win_w, win_h)
         save_dc.SelectObject(bitmap)
 
-        # BitBlt 從 client DC 複製到 save_dc（不含視窗邊框/標題列）
-        save_dc.BitBlt((0, 0), (cw, ch), mfc_dc, (0, 0), win32con.SRCCOPY)
+        # Step 3: PrintWindow + PW_RENDERFULLCONTENT → 捕捉 GPU 合成內容
+        result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), PW_RENDERFULLCONTENT)
+        if not result:
+            print("[WARN] PrintWindow 回傳 0，嘗試繼續...")
 
         bmp_info = bitmap.GetInfo()
         bmp_str  = bitmap.GetBitmapBits(True)
-        img = Image.frombuffer(
+        full_img = Image.frombuffer(
             "RGB", (bmp_info["bmWidth"], bmp_info["bmHeight"]),
             bmp_str, "raw", "BGRX", 0, 1
         )
         win32gui.DeleteObject(bitmap.GetHandle())
         save_dc.DeleteDC()
         mfc_dc.DeleteDC()
-        win32gui.ReleaseDC(hwnd, client_dc)
+        win32gui.ReleaseDC(hwnd, win_dc)
 
-        print(f"[INFO] client area (BitBlt): {cw}×{ch}")
-        return img
+        # Step 4: 取視覺邊框（DWM，修正最大化偏移）
+        visual = _get_visual_rect(hwnd)
+        if visual is None:
+            # 退路：直接用 GetWindowRect
+            visual = win_rect
+
+        vis_left, vis_top, vis_right, vis_bottom = visual
+
+        # Step 5: ClientToScreen 取 client area 左上角螢幕座標
+        pt = _POINT(0, 0)
+        ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(pt))
+        client_screen_x, client_screen_y = pt.x, pt.y
+
+        # Step 6: 取 client 尺寸
+        client_rect = win32gui.GetClientRect(hwnd)
+        cw = client_rect[2] - client_rect[0]
+        ch = client_rect[3] - client_rect[1]
+
+        # Step 7: 計算在 PrintWindow 截圖中的 crop 座標
+        # PrintWindow 截的圖對應 GetWindowRect，但視覺起點是 visual rect
+        # → crop offset = (client_screen - visual_origin)
+        crop_x = client_screen_x - vis_left
+        crop_y = client_screen_y - vis_top
+        crop_x2 = crop_x + cw
+        crop_y2 = crop_y + ch
+
+        # 邊界保護
+        img_w, img_h = full_img.size
+        crop_x  = max(0, min(crop_x,  img_w))
+        crop_y  = max(0, min(crop_y,  img_h))
+        crop_x2 = max(0, min(crop_x2, img_w))
+        crop_y2 = max(0, min(crop_y2, img_h))
+
+        if crop_x2 <= crop_x or crop_y2 <= crop_y:
+            print(f"[WARN] crop 範圍無效: ({crop_x},{crop_y})-({crop_x2},{crop_y2})，回傳完整截圖")
+            return full_img
+
+        client_img = full_img.crop((crop_x, crop_y, crop_x2, crop_y2))
+        print(f"[INFO] PrintWindow 截圖成功: window={win_w}×{win_h}, "
+              f"client={cw}×{ch}, crop=({crop_x},{crop_y})")
+        return client_img
 
     except Exception as e:
-        print(f"[WARN] BitBlt 截圖失敗: {e}")
+        print(f"[WARN] PrintWindow 截圖失敗: {e}")
+        import traceback; traceback.print_exc()
         return None
 
 
@@ -174,7 +257,7 @@ class WindowCapture:
     def capture(self) -> Image.Image:
         img = None
         if sys.platform == "win32" and HAS_WIN32 and self.hwnd:
-            img = _capture_client_bitblt(self.hwnd)
+            img = _capture_printwindow(self.hwnd)
         elif sys.platform == "darwin" and self.window_title:
             img = self._capture_mac()
         if img is None: img = self._capture_fullscreen()
@@ -510,7 +593,7 @@ def on_f9():
 
 def run_hotkey_mode():
     print("\n╔" + "═"*54 + "╗")
-    print("║  GameSofa Screen Reader v7 — regions.json 優先讀取  ║")
+    print("║  GameSofa Screen Reader v8 — PrintWindow GPU 截圖   ║")
     print("╠" + "═"*54 + "╣")
     wc = get_window_capture()
     if wc.window_title:
@@ -547,12 +630,12 @@ def run_manual_mode():
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n  GameSofa Screen Reader v7 (regions.json 優先讀取)")
+    print("\n  GameSofa Screen Reader v8 (PrintWindow + PW_RENDERFULLCONTENT)")
     print(f"    keyboard    : {'✓' if HAS_KEYBOARD  else '✗ pip install keyboard'}")
     print(f"    pyautogui   : {'✓' if HAS_PYAUTOGUI else '✗ pip install pyautogui'}")
     print(f"    opencv      : {'✓' if HAS_CV2       else '✗ pip install opencv-python'}")
     print(f"    pytesseract : {'✓' if HAS_TESS      else '✗ pip install pytesseract'}")
-    print(f"    pywin32     : {'✓ (BitBlt 背景截圖)' if HAS_WIN32 else '✗ pip install pywin32'}")
+    print(f"    pywin32     : {'✓ (PrintWindow GPU 截圖)' if HAS_WIN32 else '✗ pip install pywin32'}")
     print()
     if HAS_KEYBOARD: run_hotkey_mode()
     else: run_manual_mode()
