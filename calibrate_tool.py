@@ -10,7 +10,7 @@ calibrate_tool.py  —  GameSofa 辨識區塊拖拉校正工具
   2. 用視窗顯示截圖，每個辨識框以彩色顯示
   3. 點選框 → 拖拉邊緣/角落 可調整大小
   4. 點選框內部 → 整框移動
-  5. 按 [儲存並寫入 screen_reader.py] → 自動更新 REGIONS_REL
+  5. 按 [儲存] → 寫入 regions.json（screen_reader.py 啟動時自動讀取）
   6. 按 [重新截圖] → 重新取得目前選定視窗
   7. 按 [選擇視窗] → 重新挑選目標視窗
 
@@ -23,7 +23,7 @@ calibrate_tool.py  —  GameSofa 辨識區塊拖拉校正工具
 依賴: tkinter (內建), Pillow
 """
 
-import sys, re
+import sys, re, json
 from pathlib import Path
 from tkinter import (
     Tk, Toplevel, Canvas, Frame, Button, Label, StringVar,
@@ -39,6 +39,7 @@ except ImportError:
     sys.exit(1)
 
 SCREEN_READER_PATH = Path("screen_reader.py")
+REGIONS_JSON_PATH  = Path("regions.json")
 DEBUG_DIR          = Path("debug_crops")
 MAX_DISPLAY_W      = 1280
 MAX_DISPLAY_H      = 860
@@ -73,63 +74,104 @@ DEFAULT_REGIONS = {
 
 
 def load_regions_from_file():
-    if not SCREEN_READER_PATH.exists():
-        print("[WARN] screen_reader.py 不存在，使用預設值")
-        return dict(DEFAULT_REGIONS)
-    src = SCREEN_READER_PATH.read_text(encoding="utf-8")
-    m = re.search(r'REGIONS_REL\s*=\s*\{([^}]+)\}', src, re.DOTALL)
-    if not m:
-        print("[WARN] 無法解析 REGIONS_REL，使用預設值")
-        return dict(DEFAULT_REGIONS)
-    regions = {}
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        m2 = re.match(
-            r'"([\w]+)"\s*:\s*\(([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)\)',
-            line,
+    """優先讀 regions.json，再 fallback 到 screen_reader.py 內的 REGIONS_REL，最後用預設值。"""
+    # 1. 優先讀 regions.json
+    if REGIONS_JSON_PATH.exists():
+        try:
+            raw = json.loads(REGIONS_JSON_PATH.read_text(encoding="utf-8"))
+            regions = {k: tuple(v) for k, v in raw.items()}
+            if regions:
+                print(f"[OK] 從 regions.json 讀取 {len(regions)} 個區域")
+                return regions
+        except Exception as e:
+            print(f"[WARN] regions.json 讀取失敗: {e}")
+
+    # 2. fallback: 解析 screen_reader.py
+    if SCREEN_READER_PATH.exists():
+        src = SCREEN_READER_PATH.read_text(encoding="utf-8")
+        # 用 multiline 模式正確抓到整個 _REGIONS_DEFAULT 或 REGIONS_REL 區塊
+        for var_name in ("_REGIONS_DEFAULT", "REGIONS_REL"):
+            pattern = rf'{re.escape(var_name)}\s*=\s*\{{(.*?)^\}}'
+            m = re.search(pattern, src, re.DOTALL | re.MULTILINE)
+            if m:
+                regions = {}
+                for line in m.group(1).splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    m2 = re.match(
+                        r'"([\w]+)"\s*:\s*\(([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)\)',
+                        line,
+                    )
+                    if m2:
+                        regions[m2.group(1)] = tuple(float(m2.group(i)) for i in range(2, 6))
+                if regions:
+                    print(f"[OK] 從 screen_reader.py ({var_name}) 讀取 {len(regions)} 個區域")
+                    return regions
+
+    print("[WARN] 無法讀取座標，使用預設值")
+    return dict(DEFAULT_REGIONS)
+
+
+def write_regions(regions: dict):
+    """
+    雙寫策略：
+      1. 寫入 regions.json  ← screen_reader.py 優先讀這個
+      2. 同步更新 screen_reader.py 內的 _REGIONS_DEFAULT（備份用）
+    """
+    # --- 1. 寫 regions.json ---
+    try:
+        data = {k: list(v) for k, v in regions.items()}
+        REGIONS_JSON_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        if m2:
-            regions[m2.group(1)] = tuple(float(m2.group(i)) for i in range(2, 6))
-    if not regions:
-        return dict(DEFAULT_REGIONS)
-    print(f"[OK] 從 screen_reader.py 讀取 {len(regions)} 個區域")
-    return regions
-
-
-def write_regions_to_file(regions: dict):
-    if not SCREEN_READER_PATH.exists():
-        print("[ERROR] screen_reader.py 不存在")
+        print(f"[OK] 已寫入 {REGIONS_JSON_PATH}")
+    except Exception as e:
+        print(f"[ERROR] 寫入 regions.json 失敗: {e}")
         return False
-    src = SCREEN_READER_PATH.read_text(encoding="utf-8")
-    lines = ["REGIONS_REL = {\n"]
-    for group_name, keys in [
-        ("手牌", ["hole_1", "hole_2"]),
-        ("公共牌", ["board_1", "board_2", "board_3", "board_4", "board_5"]),
-        ("底池", ["pot"]),
-        ("自己籌碼", ["my_stack"]),
-        ("Blind", ["blind"]),
-    ]:
-        lines.append(f"    # ── {group_name} ──\n")
-        for key in keys:
-            if key in regions:
-                v = regions[key]
-                lines.append(
-                    f'    "{key}":{" " * (10 - len(key))}({v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f}, {v[3]:.4f}),\n'
-                )
-    lines.append("}\n")
-    new_block = "".join(lines)
-    new_src = re.sub(r'REGIONS_REL\s*=\s*\{[^}]+\}\s*\n', new_block, src, flags=re.DOTALL)
-    if new_src == src:
+
+    # --- 2. 同步更新 screen_reader.py ---
+    if not SCREEN_READER_PATH.exists():
+        print("[WARN] screen_reader.py 不存在，跳過同步")
+        return True
+
+    try:
+        src = SCREEN_READER_PATH.read_text(encoding="utf-8")
+
+        # 組出新的 _REGIONS_DEFAULT 區塊
+        lines = ["_REGIONS_DEFAULT = {\n"]
+        for group_name, keys in [
+            ("手牌", ["hole_1", "hole_2"]),
+            ("公共牌", ["board_1", "board_2", "board_3", "board_4", "board_5"]),
+            ("底池", ["pot"]),
+            ("自己籌碼", ["my_stack"]),
+            ("Blind", ["blind"]),
+        ]:
+            lines.append(f"    # ── {group_name} ──\n")
+            for key in keys:
+                if key in regions:
+                    v = regions[key]
+                    pad = " " * (10 - len(key))
+                    lines.append(f'    "{key}":{pad}({v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f}, {v[3]:.4f}),\n')
+        lines.append("}\n")
+        new_block = "".join(lines)
+
+        # multiline 替換：從行首的 _REGIONS_DEFAULT = { 一直到獨立一行的 }
         new_src = re.sub(
-            r'REGIONS_REL\s*=\s*\{.*?^\}',
+            r'^_REGIONS_DEFAULT\s*=\s*\{.*?^\}\s*$',
             new_block.rstrip(),
             src,
             flags=re.DOTALL | re.MULTILINE,
         )
-    SCREEN_READER_PATH.write_text(new_src, encoding="utf-8")
-    print(f"[OK] 已更新 {SCREEN_READER_PATH}")
+
+        if new_src == src:
+            print("[WARN] screen_reader.py 的 _REGIONS_DEFAULT 替換未生效（可能格式有異），regions.json 已寫入，不影響運作")
+        else:
+            SCREEN_READER_PATH.write_text(new_src, encoding="utf-8")
+            print(f"[OK] 已同步更新 {SCREEN_READER_PATH} 的 _REGIONS_DEFAULT")
+    except Exception as e:
+        print(f"[WARN] 同步 screen_reader.py 失敗: {e}（regions.json 已寫入，不影響運作）")
+
     return True
 
 
@@ -165,7 +207,7 @@ def list_visible_windows():
         return []
 
 
-def choose_window_dialog(parent) -> tuple[int | None, str | None]:
+def choose_window_dialog(parent) -> tuple:
     windows = list_visible_windows()
     if not windows:
         messagebox.showerror("找不到視窗", "目前沒有可選擇的可見視窗")
@@ -354,7 +396,7 @@ class CalibrateApp:
         )
         Button(toolbar, text="🪟 選擇視窗 (W)", command=self._choose_window, **btn).pack(side=LEFT, padx=4)
         Button(toolbar, text="📷 重新截圖 (R)", command=self._retake, **btn).pack(side=LEFT, padx=4)
-        Button(toolbar, text="💾 儲存並寫入 screen_reader.py (S)", command=self._save, **btn).pack(side=LEFT, padx=4)
+        Button(toolbar, text="💾 儲存 regions.json (S)", command=self._save, **btn).pack(side=LEFT, padx=4)
         Button(toolbar, text="↺ 還原選取框 (Del)", command=self._reset_selected, **btn).pack(side=LEFT, padx=4)
         Button(toolbar, text="↺↺ 全部還原", command=self._reset_all, **btn).pack(side=LEFT, padx=4)
 
@@ -645,14 +687,19 @@ class CalibrateApp:
             self.status_var.set("已還原全部區域")
 
     def _save(self):
-        if not messagebox.askyesno("儲存", "確定要將新座標寫入 screen_reader.py？"):
+        if not messagebox.askyesno("儲存", "確定要將新座標寫入 regions.json？"):
             return
-        if write_regions_to_file(self.regions):
+        if write_regions(self.regions):
             self.orig_regions = {k: tuple(v) for k, v in self.regions.items()}
-            self.status_var.set("✅ 已儲存到 screen_reader.py")
-            messagebox.showinfo("儲存成功", "座標已更新！\n下次執行 screen_reader.py 會使用新座標。")
+            self.status_var.set("✅ 已儲存到 regions.json")
+            messagebox.showinfo(
+                "儲存成功",
+                "座標已寫入 regions.json！\n"
+                "下次執行 screen_reader.py 會自動載入新座標。\n"
+                "（不需要重新啟動，下次執行時生效）"
+            )
         else:
-            messagebox.showerror("儲存失敗", "無法寫入 screen_reader.py")
+            messagebox.showerror("儲存失敗", "無法寫入 regions.json")
 
 
 if __name__ == "__main__":

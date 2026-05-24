@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GameSofa Texas Hold'em Screen Reader v5
+GameSofa Texas Hold'em Screen Reader v6
 =========================================
 F6 → 校正模式 (存 debug_crops/ 並印出實際尺寸，方便微調座標)
 F7 → 切換自動輪詢
@@ -10,14 +10,9 @@ F10 → 離開
 
 座標說明
 --------
-REGIONS_REL 用比例座標 (0.0~1.0)，基準截圖已在內部量測。
-PrintWindow 拿到的是「整個視窗」包含標題列，
-所以 Y 比例要包含標題列高度。
-Edge/Chrome 標題列 ≈ 32px，書籤列 ≈ 37px
-→ 有效桌面起點 ≈ y=0.09 (69/748)
-
-如果辨識還是偏掉，按 F6 校正後看 debug_crops/_annotated.png
-再調整下方 REGIONS_REL 的數字。
+REGIONS_REL 用比例座標 (0.0~1.0)，啟動時會優先讀取 regions.json。
+若 regions.json 不存在才使用程式內 hardcode 預設值。
+用 calibrate_tool.py 調整後儲存，即可同步到此程式。
 """
 
 import sys, os, time, json, subprocess, tempfile, threading
@@ -180,19 +175,10 @@ def get_window_capture() -> WindowCapture:
 
 # ─────────────────────────────────────────────────────────────
 # REGIONS  ── 比例座標 (0.0 ~ 1.0)
-#
-# 量測基準: Edge 視窗 1057×748 (含32px標題列+37px書籤列)
-# GameSofa 有效桌面起點約 y=0.092 (≈69px)
-#
-# ┌─ 手牌 (底部中央玩家，固定位置) ────────────────────────────┐
-#   10♠: x≈0.514~0.570, y≈0.733~0.853
-#   6♦ : x≈0.573~0.630, y≈0.733~0.853
-# └────────────────────────────────────────────────────────────┘
-# ┌─ 公共牌 (桌面中央) ─────────────────────────────────────────┐
-#   5張等距: x≈0.312~0.729, y≈0.508~0.642
-# └────────────────────────────────────────────────────────────┘
+# 啟動時優先讀 regions.json（由 calibrate_tool.py 產生）
+# 若不存在則使用下方 hardcode 預設值
 # ─────────────────────────────────────────────────────────────
-REGIONS_REL = {
+_REGIONS_DEFAULT = {
     # ── 手牌 (自己，底部中央固定位置) ──
     "hole_1":   (0.5137, 0.7326, 0.5705, 0.8529),
     "hole_2":   (0.5733, 0.7326, 0.6301, 0.8529),
@@ -213,6 +199,25 @@ REGIONS_REL = {
     # ── Blind (右上角) ──
     "blind":    (0.8136, 0.2246, 0.9082, 0.2674),
 }
+
+REGIONS_JSON = Path("regions.json")
+
+def _load_regions() -> dict:
+    """優先讀 regions.json，失敗則用 hardcode 預設值。"""
+    if REGIONS_JSON.exists():
+        try:
+            raw = json.loads(REGIONS_JSON.read_text(encoding="utf-8"))
+            regions = {k: tuple(v) for k, v in raw.items()}
+            print(f"[OK] 從 regions.json 載入 {len(regions)} 個區域")
+            return regions
+        except Exception as e:
+            print(f"[WARN] regions.json 讀取失敗 ({e})，使用預設值")
+    else:
+        print("[INFO] regions.json 不存在，使用 hardcode 預設值")
+        print("[INFO] 請執行 calibrate_tool.py 校正後儲存，座標會自動同步")
+    return dict(_REGIONS_DEFAULT)
+
+REGIONS_REL = _load_regions()
 
 def abs_region(rel, actual_w, actual_h):
     rx1, ry1, rx2, ry2 = rel
@@ -243,28 +248,24 @@ def detect_suit_by_color(crop_img):
 # ─────────────────────────────────────────────────────────────
 # RANK DETECTION
 # ─────────────────────────────────────────────────────────────
-# T = Ten(10)，這是德州撲克標準縮寫，顯示時轉成 "10"
 RANK_MAP = {
     'a':'A', '1':'A',
     '2':'2', '3':'3', '4':'4', '5':'5',
     '6':'6', '7':'7', '8':'8', '9':'9',
-    '0':'10', 't':'10', '10':'10',   # ← 統一顯示 10，不用 T
+    '0':'10', 't':'10', '10':'10',
     'j':'J', 'q':'Q', 'k':'K',
 }
 SUIT_FALLBACK = {"red":"♥", "black":"♠"}
-RANK_DISPLAY  = {"10":"10"}  # 顯示時用完整字串
 
 def preprocess_for_ocr(crop_img):
-    """裁左上角 → 4x 放大 → Otsu 二值化 → erosion 去雜"""
     w, h = crop_img.size
-    # 取左上角 45%×40%，這裡有 rank 數字
     corner = crop_img.crop((0, 0, int(w*0.45), int(h*0.40)))
     corner = corner.resize((corner.width*4, corner.height*4), Image.LANCZOS)
     corner = corner.convert("L")
     if HAS_CV2:
         arr = np.array(corner)
         _, binary = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        if binary.mean() < 127: binary = 255 - binary   # 保持白底黑字
+        if binary.mean() < 127: binary = 255 - binary
         kernel = np.ones((2,2), np.uint8)
         binary = cv2.erode(binary, kernel, iterations=1)
         corner = Image.fromarray(binary)
@@ -287,29 +288,20 @@ def detect_rank_ocr(crop_img):
 
 # ─────────────────────────────────────────────────────────────
 # EMPTY SLOT DETECTION
-# 判斷邏輯:
-#   1. teal 比例 > 45%  → 空
-#   2. white 比例 < 15% → 可能空（配合 teal > 15% 才判空）
-#   3. 有牌時 white ≥ 15%（牌面白色邊框 + 背景）
 # ─────────────────────────────────────────────────────────────
 def is_empty_slot(crop_img):
     if HAS_CV2:
         arr = np.array(crop_img.convert("RGB"))
         total = arr.shape[0] * arr.shape[1]
         hsv   = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-
-        # GameSofa 桌面 teal: H≈85~105 (藍綠), 深淺都要涵蓋
         teal  = cv2.countNonZero(cv2.inRange(hsv,
                     np.array([75, 25, 30]), np.array([115, 255, 230])))
-        # 白色牌面
         white = cv2.countNonZero(cv2.inRange(arr,
                     np.array([210,210,210]), np.array([255,255,255])))
-
         tr = teal  / total
         wr = white / total
-
-        if tr > 0.45:               return True   # 明顯 teal 背景
-        if wr < 0.15 and tr > 0.15: return True   # 幾乎沒白色且有 teal
+        if tr > 0.45:               return True
+        if wr < 0.15 and tr > 0.15: return True
         return False
     else:
         arr = crop_img.convert("RGB"); w, h = arr.size
@@ -384,7 +376,7 @@ def capture_and_analyze(save_debug=True, debug_dir="debug_crops"):
     return results, annotated
 
 # ─────────────────────────────────────────────────────────────
-# CALIBRATE MODE (F6) — 印出每個 region 的實際像素座標
+# CALIBRATE MODE (F6)
 # ─────────────────────────────────────────────────────────────
 def on_f6_calibrate():
     print("\n[F6] 校正模式 — 截圖並印出各區域像素座標")
@@ -398,7 +390,6 @@ def on_f6_calibrate():
         for name, rel in REGIONS_REL.items():
             x1,y1,x2,y2 = abs_region(rel, actual_w, actual_h)
             print(f"  {name:<12} {x1:>6} {y1:>6} {x2:>6} {y2:>6}")
-        # 存完整截圖 + 標注框
         Path("debug_crops").mkdir(exist_ok=True)
         annotated = screenshot.copy()
         draw = ImageDraw.Draw(annotated)
@@ -492,11 +483,13 @@ def on_f9():
 
 def run_hotkey_mode():
     print("\n╔" + "═"*54 + "╗")
-    print("║  GameSofa Screen Reader v5 — 比例座標 + 校正模式    ║")
+    print("║  GameSofa Screen Reader v6 — regions.json 優先讀取  ║")
     print("╠" + "═"*54 + "╣")
     wc = get_window_capture()
     if wc.window_title:
         print(f"║  視窗: {wc.window_title[:46]:<46} ║")
+    src = "regions.json" if REGIONS_JSON.exists() else "hardcode 預設值"
+    print(f"║  座標來源: {src:<43} ║")
     print("║  F6  → 校正模式 (存 debug_crops/_calibrate.png)    ║")
     print("║  F7  → 切換自動輪詢 (每秒辨識)                     ║")
     print("║  F8  → 重新選擇視窗                                 ║")
@@ -527,7 +520,7 @@ def run_manual_mode():
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n  GameSofa Screen Reader v5 (比例座標 + 校正模式)")
+    print("\n  GameSofa Screen Reader v6 (regions.json 優先讀取)")
     print(f"    keyboard    : {'✓' if HAS_KEYBOARD  else '✗ pip install keyboard'}")
     print(f"    pyautogui   : {'✓' if HAS_PYAUTOGUI else '✗ pip install pyautogui'}")
     print(f"    opencv      : {'✓' if HAS_CV2       else '✗ pip install opencv-python'}")
