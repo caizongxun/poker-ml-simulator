@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GameSofa Texas Hold'em Screen Reader v10.1
+GameSofa Texas Hold'em Screen Reader v10.2
 ===========================================
 F6 → 校正模式
 F7 → 切換自動輪詢
@@ -8,7 +8,7 @@ F8 → 重新選擇視窗
 F9 → 單次截圖辨識
 F10 → 離開
 
-花色辨識 (v10.1)
+花色辨識 (v10.2)
 --------
 優先使用 suit_templates/ 本地樣本做模板匹配：
   suit_templates/
@@ -23,6 +23,11 @@ F10 → 離開
 2. 對每個花色的所有樣本做 cv2.matchTemplate (TM_CCOEFF_NORMED)
 3. 取最高分決定花色 (threshold = 0.45)
 4. 若分數不足或無樣本 → fallback 回輪廓形狀分析
+
+v10.2 修正：
+- is_empty_slot: 若偵測到紅色或黑色花色像素，強制返回 False（不誤判被遮手牌）
+- analyze_card_region: hole_1 為疊牌（左半被 hole_2 遮住），
+  改用右側 50% 區域做 OCR 及花色辨識
 """
 
 import sys, os, time, json, subprocess, tempfile, threading, ctypes
@@ -291,7 +296,7 @@ def abs_region(rel, actual_w, actual_h):
 
 
 # ───────────────────────────────────────────────────────────────
-# SUIT TEMPLATE MATCHING v10.1
+# SUIT TEMPLATE MATCHING v10.2
 # ───────────────────────────────────────────────────────────────
 TEMPLATES_DIR = Path("suit_templates")
 
@@ -347,14 +352,19 @@ def _load_templates() -> dict:
 #   calibrate_tool.py extract_suit_icon:
 #     x1=0, x2=int(w*0.38), y1=int(h*0.33), y2=int(h*0.80)
 # ----------------------------------------------------------------
-def _extract_suit_roi(card_img_rgb: np.ndarray) -> np.ndarray | None:
+def _extract_suit_roi(card_img_rgb: np.ndarray, right_half: bool = False) -> np.ndarray | None:
     """
-    從卡牌圖片裁出花色圖標 ROI，與 calibrate_tool.py 完全一致。
-    區域: x=0~38%寬， y=33%~80%高
+    從卡牌圖片裁出花色圖標 ROI。
+    right_half=True 時改從右側 50% 裁取（用於 hole_1 疊牌情況）。
+    區域: x=0~38%寬， y=33%~80%高  (或右半牌同比例)
     回傳 64×64 灰階圖。
     """
     h, w = card_img_rgb.shape[:2]
-    x1, x2 = 0,          int(w * 0.38)
+    if right_half:
+        # hole_1 右側可見區：從 x=50% 開始，取右側的 38% 範圍 → x=50%~88%
+        x1, x2 = int(w * 0.50), int(w * 0.88)
+    else:
+        x1, x2 = 0, int(w * 0.38)
     y1, y2 = int(h * 0.33), int(h * 0.80)
     roi = card_img_rgb[y1:y2, x1:x2]
     if roi.size == 0:
@@ -364,9 +374,10 @@ def _extract_suit_roi(card_img_rgb: np.ndarray) -> np.ndarray | None:
     return roi_resized
 
 
-def detect_suit_by_template(card_img: Image.Image, color: str):
+def detect_suit_by_template(card_img: Image.Image, color: str, right_half: bool = False):
     """
     用模板匹配辨識花色。
+    right_half=True 時從右側 50% 區域取花色 ROI（hole_1 疊牌用）。
     回傳 (suit_symbol, detail_str) 或 (None, reason) 若無法判斷。
     """
     if not HAS_CV2:
@@ -377,7 +388,7 @@ def detect_suit_by_template(card_img: Image.Image, color: str):
         return None, "no_templates"
 
     arr = np.array(card_img.convert("RGB"))
-    roi = _extract_suit_roi(arr)
+    roi = _extract_suit_roi(arr, right_half=right_half)
     if roi is None:
         return None, "no_roi"
 
@@ -417,7 +428,7 @@ def detect_suit_by_template(card_img: Image.Image, color: str):
 
 
 # ───────────────────────────────────────────────────────────────
-# SUIT DETECTION FALLBACK — 輪廓形狀分析 (v9 邏輯，保留為備援)
+# SUIT DETECTION FALLBACK — 輪廓形狀分析 (保留為備援)
 # ───────────────────────────────────────────────────────────────
 
 def _extract_suit_symbol_mask(crop_rgb_arr, color):
@@ -529,16 +540,17 @@ def detect_suit_by_color(crop_img: Image.Image) -> str:
         return "red" if red > black*0.3 else "black"
 
 
-def detect_suit(crop_img: Image.Image):
+def detect_suit(crop_img: Image.Image, right_half: bool = False):
     """
     主入口：
     1. 顏色判斷 (red/black)
     2. 模板匹配 (suit_templates/)
     3. fallback → 輪廓形狀分析
+    right_half=True: hole_1 疊牌模式，從右側取花色 ROI
     回傳 (color, suit_symbol, detail)
     """
     color = detect_suit_by_color(crop_img)
-    suit, detail = detect_suit_by_template(crop_img, color)
+    suit, detail = detect_suit_by_template(crop_img, color, right_half=right_half)
     if suit is not None:
         return color, suit, detail
     suit, detail = detect_suit_by_shape(crop_img, color)
@@ -556,10 +568,18 @@ RANK_MAP = {
     'j':'J', 'q':'Q', 'k':'K',
 }
 
-def preprocess_for_ocr(crop_img):
+def preprocess_for_ocr(crop_img, right_half: bool = False):
+    """
+    裁取牌面左上角（或右上角）數字區塊做 OCR 前處理。
+    right_half=True: hole_1 疊牌，改取右上角 (x=55%~100%, y=0~40%)
+    """
     w, h = crop_img.size
-    corner = crop_img.crop((0, 0, int(w*0.45), int(h*0.40)))
-    corner = corner.resize((corner.width*4, corner.height*4), Image.LANCZOS)
+    if right_half:
+        # 右上角點數：x=55%~100%, y=0~40%
+        corner = crop_img.crop((int(w * 0.55), 0, w, int(h * 0.40)))
+    else:
+        corner = crop_img.crop((0, 0, int(w * 0.45), int(h * 0.40)))
+    corner = corner.resize((corner.width * 4, corner.height * 4), Image.LANCZOS)
     corner = corner.convert("L")
     if HAS_CV2:
         arr = np.array(corner)
@@ -572,9 +592,9 @@ def preprocess_for_ocr(crop_img):
         corner = corner.point(lambda p: 255 if p > 128 else 0, "1")
     return corner
 
-def detect_rank_ocr(crop_img):
+def detect_rank_ocr(crop_img, right_half: bool = False):
     if not HAS_TESS: return "?"
-    corner = preprocess_for_ocr(crop_img)
+    corner = preprocess_for_ocr(crop_img, right_half=right_half)
     cfg = r'--psm 10 -c tessedit_char_whitelist=AaKkQqJjTt0123456789'
     try:
         text = pytesseract.image_to_string(corner, config=cfg).strip().lower()
@@ -587,9 +607,37 @@ def detect_rank_ocr(crop_img):
 
 
 # ───────────────────────────────────────────────────────────────
-# EMPTY SLOT DETECTION
+# EMPTY SLOT DETECTION  v10.2
 # ───────────────────────────────────────────────────────────────
-def is_empty_slot(crop_img):
+def _has_suit_pixels(crop_img: Image.Image) -> bool:
+    """
+    快速檢查是否存在明顯的紅色或黑色花色像素。
+    只要有就表示這是一張牌（即使被部分遮住），不應視為空位。
+    """
+    if not HAS_CV2:
+        return False
+    arr = np.array(crop_img.convert("RGB"))
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    # 紅色花色像素
+    m1 = cv2.inRange(hsv, np.array([0,  120, 80]),  np.array([12, 255, 255]))
+    m2 = cv2.inRange(hsv, np.array([160, 120, 80]), np.array([180, 255, 255]))
+    red_px = cv2.countNonZero(m1) + cv2.countNonZero(m2)
+    # 深黑色花色像素（排除陰影，只算純黑）
+    black_px = cv2.countNonZero(cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 60, 70])))
+    total = arr.shape[0] * arr.shape[1]
+    # 只要有 1% 以上的紅色或 2% 以上的黑色花色像素，就認定為有牌
+    return (red_px / total > 0.01) or (black_px / total > 0.02)
+
+
+def is_empty_slot(crop_img: Image.Image) -> bool:
+    """
+    v10.2: 先用 _has_suit_pixels 保護 — 有花色像素一定不是空位。
+    再用原有青色/白色比例判斷。
+    """
+    # 保護：有紅色或黑色花色像素 → 一定有牌
+    if _has_suit_pixels(crop_img):
+        return False
+
     if HAS_CV2:
         arr   = np.array(crop_img.convert("RGB"))
         total = arr.shape[0] * arr.shape[1]
@@ -617,19 +665,32 @@ def is_empty_slot(crop_img):
         return False
 
 
-def analyze_card_region(crop_img, region_name):
+def analyze_card_region(crop_img: Image.Image, region_name: str) -> dict:
+    """
+    v10.2: hole_1 為疊牌（左半被 hole_2 壓住），
+    使用 right_half=True 從右側取花色 ROI 及 OCR 點數。
+    """
     result = {"rank":"?","suit":"?","color":"unknown","confidence":0.0,"region":region_name}
+
     if is_empty_slot(crop_img):
         result["rank"] = None; result["suit"] = None; return result
 
-    color, suit, suit_detail = detect_suit(crop_img)
+    # hole_1 疊牌：左半被遮，改用右側辨識
+    right_half = (region_name == "hole_1")
+
+    color, suit, suit_detail = detect_suit(crop_img, right_half=right_half)
     result["color"] = color
     result["suit"]  = suit
 
-    rank = detect_rank_ocr(crop_img)
+    rank = detect_rank_ocr(crop_img, right_half=right_half)
+
+    # hole_1 右側 OCR 失敗時再試左側（有時右側也看得到點數）
+    if right_half and rank == "?":
+        rank = detect_rank_ocr(crop_img, right_half=False)
+
     result["rank"]        = rank
     result["confidence"]  = 0.9 if rank != "?" else 0.3
-    result["suit_detail"] = suit_detail
+    result["suit_detail"] = suit_detail + (" [right_half]" if right_half else "")
     return result
 
 
@@ -802,7 +863,7 @@ def on_f9():
 
 def run_hotkey_mode():
     print("\n╔" + "═"*54 + "╗")
-    print("║  GameSofa Screen Reader v10.1 — 模板匹配花色辨識        ║")
+    print("║  GameSofa Screen Reader v10.2 — 疊牌手牌辨識修正        ║")
     print("╠" + "═"*54 + "╣")
     wc = get_window_capture()
     if wc.window_title:
@@ -844,7 +905,7 @@ def run_manual_mode():
 # ENTRY POINT
 # ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("\n  GameSofa Screen Reader v10.1 (模板匹配花色辨識 + PrintWindow GPU 截圖)")
+    print("\n  GameSofa Screen Reader v10.2 (疊牌手牌辨識 + PrintWindow GPU 截圖)")
     print(f"    keyboard    : {'✓' if HAS_KEYBOARD  else '✗ pip install keyboard'}")
     print(f"    pyautogui   : {'✓' if HAS_PYAUTOGUI else '✗ pip install pyautogui'}")
     print(f"    opencv      : {'✓' if HAS_CV2       else '✗ pip install opencv-python'}")
