@@ -38,6 +38,11 @@ from tkinter import (
     LEFT, RIGHT, TOP, BOTTOM, X, Y, END,
     HORIZONTAL, VERTICAL, NW, ALL, IntVar, Radiobutton
 )
+try:
+    import tkinter as _tk
+    _TclError = _tk.TclError
+except Exception:
+    _TclError = Exception
 
 try:
     from PIL import Image, ImageTk, ImageFilter
@@ -373,7 +378,6 @@ def save_suit_template(card_img: Image.Image, suit_name: str) -> Path:
     SUIT_TEMPLATE_DIR.mkdir(exist_ok=True)
     icon = extract_suit_icon(card_img)
 
-    # 判斷存存量，編號
     existing = sorted(SUIT_TEMPLATE_DIR.glob(f"{suit_name}*.png"))
     if (SUIT_TEMPLATE_DIR / f"{suit_name}.png").exists():
         idx = len(existing) + 1
@@ -387,7 +391,7 @@ def save_suit_template(card_img: Image.Image, suit_name: str) -> Path:
 
 
 def get_template_counts() -> dict:
-    """\u56de傳各花色現有樣本數量"""
+    """回傳各花色現有樣本數量"""
     counts = {}
     for name, _, _ in SUIT_SYMBOLS:
         counts[name] = len(list(SUIT_TEMPLATE_DIR.glob(f"{name}*.png")))
@@ -412,16 +416,13 @@ def suit_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str |
 
     chosen = {"suit": None}
 
-    # ── 顯示卡牌預覽 ──
     preview_frame = Frame(dlg, bg="#0d0d1a", padx=8, pady=8)
     preview_frame.pack(padx=12, pady=(12, 4))
 
-    # 完整卡牌
     card_resized = card_img.resize((120, 170), Image.LANCZOS)
     card_photo = ImageTk.PhotoImage(card_resized)
     Label(preview_frame, image=card_photo, bg="#0d0d1a", relief="solid", bd=1).pack(side=LEFT, padx=(0, 12))
 
-    # 裁切的花色圖標預覽
     icon = extract_suit_icon(card_img)
     icon_photo = ImageTk.PhotoImage(icon)
     icon_frame = Frame(preview_frame, bg="#0d0d1a")
@@ -433,7 +434,6 @@ def suit_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str |
     Label(dlg, text="請選擇此張牌的花色:",
           bg="#1a1a2e", fg="white", font=("Consolas", 11, "bold")).pack(pady=(4, 0))
 
-    # ── 4 個花色按鈕 ──
     btn_frame = Frame(dlg, bg="#1a1a2e")
     btn_frame.pack(padx=16, pady=10)
 
@@ -458,7 +458,6 @@ def suit_picker_dialog(parent, card_img: Image.Image, region_name: str) -> str |
            bg="#444", fg="white", relief="flat", padx=20, pady=6,
            font=("Consolas", 10), cursor="hand2").pack(pady=(0, 12))
 
-    # 保持 PhotoImage reference
     dlg._card_photo = card_photo
     dlg._icon_photo = icon_photo
 
@@ -492,7 +491,6 @@ class CalibrateApp:
         self.drag_start = None
         self.drag_box_start = None
 
-        # 花色樣本採集模式
         self.suit_collect_mode = False
 
         self._build_ui()
@@ -512,7 +510,6 @@ class CalibrateApp:
         Button(toolbar, text="↺ 還原選取框 (Del)",   command=self._reset_selected, **btn).pack(side=LEFT, padx=4)
         Button(toolbar, text="↺↺ 全部還原",         command=self._reset_all,      **btn).pack(side=LEFT, padx=4)
 
-        # 花色樣本採集模式切換按鈕
         self.suit_btn_var = StringVar(value="🃏 花色樣本採集 OFF (T)")
         self.suit_btn = Button(
             toolbar, textvariable=self.suit_btn_var,
@@ -545,7 +542,6 @@ class CalibrateApp:
         Label(legend, textvariable=self.coord_var, bg="#0f3460", fg="#ffcc00",
               font=("Consolas", 8), justify=LEFT, anchor="w", wraplength=150).pack(fill=X, padx=4, pady=4)
 
-        # 花色樣本統計
         Label(legend, text=" 花色樣本數", bg="#0f3460", fg="#aaa",
               font=("Consolas", 9), anchor="w").pack(fill=X)
         self.suit_count_var = StringVar(value="-")
@@ -572,14 +568,22 @@ class CalibrateApp:
 
         self.root.bind("<Delete>",   lambda e: self._reset_selected())
         self.root.bind("<BackSpace>",lambda e: self._reset_selected())
-        self.root.bind("s", lambda e: self._save())
-        self.root.bind("S", lambda e: self._save())
-        self.root.bind("r", lambda e: self._retake())
-        self.root.bind("R", lambda e: self._retake())
-        self.root.bind("w", lambda e: self._choose_window())
-        self.root.bind("W", lambda e: self._choose_window())
+        self.root.bind("s", lambda e: self._safe_retake_bind(self._save))
+        self.root.bind("S", lambda e: self._safe_retake_bind(self._save))
+        self.root.bind("r", lambda e: self._safe_retake_bind(self._retake))
+        self.root.bind("R", lambda e: self._safe_retake_bind(self._retake))
+        self.root.bind("w", lambda e: self._safe_retake_bind(self._choose_window))
+        self.root.bind("W", lambda e: self._safe_retake_bind(self._choose_window))
         self.root.bind("t", lambda e: self._toggle_suit_mode())
         self.root.bind("T", lambda e: self._toggle_suit_mode())
+
+    def _safe_retake_bind(self, fn):
+        """呼叫前確認視窗仍存活，避免 TclError。"""
+        try:
+            self.root.winfo_exists()
+            fn()
+        except _TclError as e:
+            print(f"[WARN] TclError (視窗已關閉): {e}")
 
     def _toggle_suit_mode(self):
         self.suit_collect_mode = not self.suit_collect_mode
@@ -617,7 +621,23 @@ class CalibrateApp:
         self.target_title = title
         self._retake()
 
+    def _canvas_size(self):
+        """安全取得 canvas 尺寸，若視窗已銷毀則回傳預設值。"""
+        try:
+            cw = self.canvas.winfo_width()
+            ch = self.canvas.winfo_height()
+            return cw or MAX_DISPLAY_W, ch or MAX_DISPLAY_H
+        except _TclError:
+            return MAX_DISPLAY_W, MAX_DISPLAY_H
+
     def _retake(self):
+        # 確認視窗仍然存活
+        try:
+            if not self.root.winfo_exists():
+                return
+        except _TclError:
+            return
+
         self.status_var.set("截圖中...")
         self.root.update()
         try:
@@ -628,12 +648,15 @@ class CalibrateApp:
             return
         self.screenshot = img
         self.img_w, self.img_h = img.size
-        cw = self.canvas.winfo_width() or MAX_DISPLAY_W
-        ch = self.canvas.winfo_height() or MAX_DISPLAY_H
+
+        cw, ch = self._canvas_size()          # ← 安全取得，不再直接呼叫 winfo_*
         self.scale = min(1.0, cw / self.img_w, ch / self.img_h)
         dw, dh = int(self.img_w * self.scale), int(self.img_h * self.scale)
         self.photo = ImageTk.PhotoImage(img.resize((dw, dh), Image.LANCZOS))
-        self.canvas.config(scrollregion=(0, 0, dw, dh))
+        try:
+            self.canvas.config(scrollregion=(0, 0, dw, dh))
+        except _TclError:
+            return
         target = self.target_title or "全螢幕"
         self.status_var.set(f"目標: {target} | {self.img_w}×{self.img_h} | 縮放: {self.scale:.2f}x")
         self._redraw()
@@ -645,19 +668,22 @@ class CalibrateApp:
             self.listbox.itemconfig(i, fg=REGION_COLORS.get(name, "#fff"))
 
     def _redraw(self):
-        c = self.canvas
-        c.delete(ALL)
-        if self.photo:
-            c.create_image(0, 0, anchor=NW, image=self.photo, tags="bg")
-        for name, rel in self.regions.items():
-            x1, y1, x2, y2 = self._r2c(rel)
-            clr = REGION_COLORS.get(name, "#fff")
-            width = 3 if name == self.selected else 2
-            c.create_rectangle(x1, y1, x2, y2, outline=clr, width=width, fill="", tags=("region", name))
-            if name == self.selected and not self.suit_collect_mode:
-                self._draw_handles(x1, y1, x2, y2, clr, name)
-            c.create_text(x1+4, y1+3, text=name, anchor=NW, fill="#000", font=("Consolas", 8, "bold"))
-            c.create_text(x1+3, y1+2, text=name, anchor=NW, fill=clr,   font=("Consolas", 8, "bold"))
+        try:
+            c = self.canvas
+            c.delete(ALL)
+            if self.photo:
+                c.create_image(0, 0, anchor=NW, image=self.photo, tags="bg")
+            for name, rel in self.regions.items():
+                x1, y1, x2, y2 = self._r2c(rel)
+                clr = REGION_COLORS.get(name, "#fff")
+                width = 3 if name == self.selected else 2
+                c.create_rectangle(x1, y1, x2, y2, outline=clr, width=width, fill="", tags=("region", name))
+                if name == self.selected and not self.suit_collect_mode:
+                    self._draw_handles(x1, y1, x2, y2, clr, name)
+                c.create_text(x1+4, y1+3, text=name, anchor=NW, fill="#000", font=("Consolas", 8, "bold"))
+                c.create_text(x1+3, y1+2, text=name, anchor=NW, fill=clr,   font=("Consolas", 8, "bold"))
+        except _TclError:
+            pass  # 視窗已關閉，忽略
 
     def _draw_handles(self, x1, y1, x2, y2, clr, name):
         h = HANDLE_SIZE // 2
@@ -709,7 +735,6 @@ class CalibrateApp:
         cx, cy = self._cxy(e)
         self.drag_start = (cx, cy)
 
-        # 花色採集模式：點擊到幸狀區域即觸發選擇
         if self.suit_collect_mode:
             self._collect_suit_at(cx, cy)
             return
@@ -733,15 +758,10 @@ class CalibrateApp:
         self._redraw(); self._update_coord_label()
 
     def _collect_suit_at(self, cx, cy):
-        """
-        花色採集模式下，點擊畫面任意一張牌區域圖，
-        裁切該區域圖片，彈出花色選擇對話框。
-        """
         if self.screenshot is None:
             messagebox.showwarning("尚未截圖", "請先按 R 重新截圖")
             return
 
-        # 先連截圖中的區域圖
         name = self._hit_region(cx, cy)
         if name:
             rel = self.regions[name]
@@ -752,8 +772,6 @@ class CalibrateApp:
             card_img = self.screenshot.crop((x1, y1, x2, y2))
             region_label = name
         else:
-            # 點到空白處，以點擊中心為核心手動裁切一小區。
-            # 預設切 hole_1 或 board_1 大小的區域
             default_w = int(0.07 * self.img_w)
             default_h = int(0.14 * self.img_h)
             rx = cx / self.scale
@@ -765,12 +783,10 @@ class CalibrateApp:
             card_img = self.screenshot.crop((x1, y1, x2, y2))
             region_label = f"({int(rx)},{int(ry)})"
 
-        # 彈出花色選擇
         suit = suit_picker_dialog(self.root, card_img, region_label)
         if suit is None:
             return
 
-        # 儲存樣本
         path = save_suit_template(card_img, suit)
         self._update_suit_counts()
         counts = get_template_counts()
@@ -848,11 +864,14 @@ class CalibrateApp:
             rel = self.regions[name]
             cx = (rel[0]+rel[2])/2 * self.img_w * self.scale
             cy = (rel[1]+rel[3])/2 * self.img_h * self.scale
-            tw, th = int(self.img_w*self.scale), int(self.img_h*self.scale)
-            cw = self.canvas.winfo_width()
-            ch = self.canvas.winfo_height()
-            self.canvas.xview_moveto(max(0, (cx-cw//2)/tw))
-            self.canvas.yview_moveto(max(0, (cy-ch//2)/th))
+            try:
+                tw, th = int(self.img_w*self.scale), int(self.img_h*self.scale)
+                cw = self.canvas.winfo_width()
+                ch = self.canvas.winfo_height()
+                self.canvas.xview_moveto(max(0, (cx-cw//2)/tw))
+                self.canvas.yview_moveto(max(0, (cy-ch//2)/th))
+            except _TclError:
+                pass
 
     def _update_coord_label(self):
         if not self.selected or self.selected not in self.regions:
